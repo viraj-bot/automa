@@ -87,6 +87,7 @@ class BacktestEngine:
         bp_count = 0
         errors = 0
 
+        unparsed_count = 0
         for msg in messages:
             signal = self._parser.parse(
                 msg["text"],
@@ -94,6 +95,17 @@ class BacktestEngine:
                 timestamp=msg["date"],
             )
             if signal is None:
+                # Log unparsed messages so we can improve the parser
+                preview = msg["text"].replace("\n", " ").strip()
+                if len(preview) > 200:
+                    preview = preview[:200] + "…"
+                logger.warning(
+                    "[UNPARSED] msg_id=%s date=%s | %s",
+                    msg["id"],
+                    msg["date"].strftime("%Y-%m-%d %H:%M") if hasattr(msg["date"], "strftime") else msg["date"],
+                    preview,
+                )
+                unparsed_count += 1
                 continue
 
             parsed_count += 1
@@ -126,6 +138,7 @@ class BacktestEngine:
         # Count still-open positions (shouldn't be any after force-close)
         open_positions = await self._db.get_all_positions(status="OPEN")
         summary["orphaned_positions"] = len(open_positions)
+        summary["unparsed_messages"] = unparsed_count
 
         await bt_db.close()
         return summary
@@ -168,6 +181,14 @@ class BacktestEngine:
         start = at_time.strftime("%Y-%m-%d %H:%M:%S")
         end = (at_time + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
 
+        req_params = {
+            "groww_symbol": groww_symbol,
+            "start_time": start,
+            "end_time": end,
+            "interval": "1min",
+        }
+        logger.debug("[GROWW REQ] get_historical_candles: %s", req_params)
+
         try:
             data = self._groww.get_historical_candles(
                 exchange=self._groww.EXCHANGE_NSE,
@@ -178,10 +199,16 @@ class BacktestEngine:
                 candle_interval=self._groww.CANDLE_INTERVAL_MIN_1,
             )
             candles = data.get("candles", [])
+            logger.debug(
+                "[GROWW RES] get_historical_candles %s: %d candles, data=%s",
+                groww_symbol, len(candles), data,
+            )
             if candles:
                 return float(candles[0][4])  # close price
-        except Exception:
-            logger.debug("Could not fetch historical candle for %s", groww_symbol)
+        except Exception as exc:
+            logger.debug(
+                "[GROWW ERR] get_historical_candles %s: %s", groww_symbol, exc
+            )
 
         return None
 

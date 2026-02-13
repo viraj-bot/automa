@@ -48,6 +48,7 @@ class GrowwBroker(BrokerInterface):
         logger.info("Groww API client initialised — loading instruments …")
 
         # Load instruments in a thread so we don't block the event loop
+        logger.debug("[GROWW REQ] get_all_instruments")
         loop = asyncio.get_running_loop()
         self._instruments_df = await loop.run_in_executor(
             None, self._groww.get_all_instruments
@@ -55,6 +56,11 @@ class GrowwBroker(BrokerInterface):
         logger.info(
             "Loaded %d instruments from Groww",
             len(self._instruments_df),
+        )
+        logger.debug(
+            "[GROWW RES] get_all_instruments: %d rows, columns=%s",
+            len(self._instruments_df),
+            list(self._instruments_df.columns),
         )
 
     async def shutdown(self) -> None:
@@ -101,6 +107,7 @@ class GrowwBroker(BrokerInterface):
                 f"NSE-{underlying}-{expiry_day:02d}{month_title}{yy}"
                 f"-{int(strike_price)}-{option_type}"
             )
+            logger.debug("[GROWW] Searching instrument: %s", groww_sym)
             match = df[df["groww_symbol"] == groww_sym]
             if not match.empty:
                 row = match.iloc[0]
@@ -173,6 +180,19 @@ class GrowwBroker(BrokerInterface):
 
         # Place the main BUY order
         loop = asyncio.get_running_loop()
+        order_params = {
+            "trading_symbol": instrument["trading_symbol"],
+            "quantity": quantity,
+            "validity": "DAY",
+            "exchange": "NSE",
+            "segment": "FNO",
+            "product": product,
+            "order_type": "LIMIT",
+            "transaction_type": "BUY",
+            "price": signal.entry_price,
+        }
+        logger.debug("[GROWW REQ] place_order BUY: %s", order_params)
+
         try:
             response = await loop.run_in_executor(
                 None,
@@ -192,6 +212,7 @@ class GrowwBroker(BrokerInterface):
             logger.exception("Failed to place BUY order for %s", signal.display_name)
             return
 
+        logger.debug("[GROWW RES] place_order BUY: %s", response)
         groww_order_id = response.get("groww_order_id", "")
         order_status = response.get("order_status", "UNKNOWN")
 
@@ -259,6 +280,16 @@ class GrowwBroker(BrokerInterface):
     ) -> None:
         """Place a stop-loss SELL order to protect the position."""
         loop = asyncio.get_running_loop()
+        sl_params = {
+            "trading_symbol": instrument["trading_symbol"],
+            "quantity": quantity,
+            "order_type": "SL_M",
+            "transaction_type": "SELL",
+            "trigger_price": trigger_price,
+            "product": product,
+        }
+        logger.debug("[GROWW REQ] place_order SL: %s", sl_params)
+
         try:
             response = await loop.run_in_executor(
                 None,
@@ -274,6 +305,7 @@ class GrowwBroker(BrokerInterface):
                     trigger_price=trigger_price,
                 ),
             )
+            logger.debug("[GROWW RES] place_order SL: %s", response)
             logger.info(
                 "[LIVE] SL order placed for %s @ ₹%.2f — %s",
                 instrument["trading_symbol"],
@@ -307,6 +339,15 @@ class GrowwBroker(BrokerInterface):
         product = self._settings.default_product.value
         loop = asyncio.get_running_loop()
 
+        exit_params = {
+            "trading_symbol": position["trading_symbol"],
+            "quantity": position["quantity"],
+            "order_type": "MARKET",
+            "transaction_type": "SELL",
+            "product": product,
+        }
+        logger.debug("[GROWW REQ] place_order EXIT: %s", exit_params)
+
         try:
             response = await loop.run_in_executor(
                 None,
@@ -325,6 +366,7 @@ class GrowwBroker(BrokerInterface):
             logger.exception("[LIVE] Failed to place EXIT order for %s", position["trading_symbol"])
             return
 
+        logger.debug("[GROWW RES] place_order EXIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
 
         order_id = await self._db.insert_order(
@@ -394,6 +436,16 @@ class GrowwBroker(BrokerInterface):
         else:
             order_kwargs["order_type"] = self.groww.ORDER_TYPE_MARKET
 
+        bp_params = {
+            "trading_symbol": position["trading_symbol"],
+            "quantity": position["quantity"],
+            "order_type": "LIMIT" if exit_price else "MARKET",
+            "transaction_type": "SELL",
+            "price": exit_price,
+            "product": product,
+        }
+        logger.debug("[GROWW REQ] place_order BOOK_PROFIT: %s", bp_params)
+
         try:
             response = await loop.run_in_executor(
                 None,
@@ -406,6 +458,7 @@ class GrowwBroker(BrokerInterface):
             )
             return
 
+        logger.debug("[GROWW RES] place_order BOOK_PROFIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
 
         order_id = await self._db.insert_order(

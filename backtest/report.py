@@ -32,6 +32,10 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     overview.add_row("  Exit signals", f"[yellow]{exits}[/yellow]")
     overview.add_row("  Book profit signals", f"[cyan]{bps}[/cyan]")
 
+    unparsed = summary.get("unparsed_messages", 0)
+    if unparsed:
+        overview.add_row("  Unparsed messages", f"[dim]{unparsed}[/dim]")
+
     errors = summary.get("errors", 0)
     if errors:
         overview.add_row("  Errors", f"[red]{errors}[/red]")

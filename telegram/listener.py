@@ -95,7 +95,16 @@ class TelegramListener:
             text, message_id=msg_id, timestamp=timestamp
         )
         if signal is None:
-            return  # not a trade signal
+            # Log unparsed messages so we can improve the parser
+            preview = text.replace("\n", " ").strip()
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+            logger.warning(
+                "[UNPARSED] msg_id=%d | %s",
+                msg_id,
+                preview,
+            )
+            return
 
         logger.info(
             "Parsed %s signal: %s",
