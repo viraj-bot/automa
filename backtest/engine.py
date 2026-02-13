@@ -5,6 +5,7 @@ and simulates trades using Groww historical candle data for realistic fills.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -22,13 +23,6 @@ from telegram.history import fetch_chat_history
 
 logger = logging.getLogger(__name__)
 
-# Month abbreviation → number for datetime construction
-_MONTH_NUM = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
-    "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
-    "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
-
 _MONTH_TITLE = {
     "JAN": "Jan", "FEB": "Feb", "MAR": "Mar", "APR": "Apr",
     "MAY": "May", "JUN": "Jun", "JUL": "Jul", "AUG": "Aug",
@@ -39,32 +33,47 @@ _MONTH_TITLE = {
 class BacktestEngine:
     """Replay historical Telegram signals against Groww historical data.
 
+    Each backtest run uses a **fresh in-memory database** so that repeated
+    runs don't see stale "already processed" markers.
+
     Workflow
     --------
     1. Fetch chat history from Telegram.
     2. Parse each message through ``SignalParser``.
-    3. For ENTRY signals, look up the actual candle price at that timestamp
-       via ``groww.get_historical_candles()`` and simulate a fill.
-    4. For EXIT / BOOK_PROFIT signals, close the simulated position using
-       the historical price.
-    5. Generate a summary report.
+    3. For ENTRY signals, record the position at the signal's entry price
+       (or the actual candle price if Groww historical data is available).
+    4. For EXIT / BOOK_PROFIT signals, close the matching position.
+       - If the signal contains an explicit exit price, use it.
+       - Otherwise try the Groww historical candle price.
+       - As a last resort, use the first target from the entry signal
+         (optimistic estimate) rather than defaulting to entry price.
+    5. After all messages are replayed, force-close any remaining open
+       positions at their stoploss (worst case) to give a realistic picture.
+    6. Generate a summary report.
     """
 
     def __init__(self, settings: Settings, db: Database) -> None:
         self._settings = settings
         self._db = db
         self._parser = SignalParser()
-        self._groww: Any = None  # lazy import to avoid hard dep in paper-only mode
+        self._groww: Any = None
 
     # ── Public API ───────────────────────────────────────────────────────
 
     async def run(self, days: int = 30, limit: Optional[int] = None) -> dict[str, Any]:
         """Execute the full backtest and return a summary dict."""
+
+        # Use a fresh in-memory DB so repeated runs start clean
+        bt_db = Database(":memory:")
+        await bt_db.connect()
+        self._db = bt_db
+
         # 1. Fetch history
         messages = await fetch_chat_history(self._settings, days=days, limit=limit)
         if not messages:
             logger.warning("No messages fetched — nothing to backtest")
-            return {"total_signals": 0}
+            await bt_db.close()
+            return {"total_signals": 0, "total_messages": 0}
 
         logger.info("Backtesting %d messages over %d days …", len(messages), days)
 
@@ -73,7 +82,10 @@ class BacktestEngine:
 
         # 3. Replay
         parsed_count = 0
-        skipped = 0
+        entry_count = 0
+        exit_count = 0
+        bp_count = 0
+        errors = 0
 
         for msg in messages:
             signal = self._parser.parse(
@@ -85,27 +97,37 @@ class BacktestEngine:
                 continue
 
             parsed_count += 1
-
-            # Idempotency
-            if await self._db.is_signal_processed(signal.signal_hash):
-                skipped += 1
-                continue
-
             signal_id = await self._db.insert_signal(signal)
 
             try:
                 await self._process_signal(signal, signal_id, msg["date"])
+                if isinstance(signal, EntrySignal):
+                    entry_count += 1
+                elif isinstance(signal, ExitSignal):
+                    exit_count += 1
+                elif isinstance(signal, BookProfitSignal):
+                    bp_count += 1
             except Exception:
-                logger.exception("Error processing signal %s", signal.signal_hash)
+                logger.exception("Error processing signal")
+                errors += 1
 
-            await self._db.mark_signal_processed(signal.signal_hash)
+        # 4. Force-close orphaned open positions at stoploss or entry price
+        await self._close_orphaned_positions()
 
-        # 4. Summary
+        # 5. Summary
         summary = await self._db.get_trade_summary()
         summary["total_messages"] = len(messages)
         summary["total_signals"] = parsed_count
-        summary["skipped_duplicates"] = skipped
+        summary["entries"] = entry_count
+        summary["exits"] = exit_count
+        summary["book_profits"] = bp_count
+        summary["errors"] = errors
 
+        # Count still-open positions (shouldn't be any after force-close)
+        open_positions = await self._db.get_all_positions(status="OPEN")
+        summary["orphaned_positions"] = len(open_positions)
+
+        await bt_db.close()
         return summary
 
     # ── Internal ─────────────────────────────────────────────────────────
@@ -114,7 +136,6 @@ class BacktestEngine:
         """Lazily create a GrowwAPI instance for historical data."""
         try:
             from growwapi import GrowwAPI
-
             self._groww = GrowwAPI(self._settings.groww_api_token)
             logger.info("Groww API initialised for backtest historical data")
         except Exception:
@@ -158,8 +179,7 @@ class BacktestEngine:
             )
             candles = data.get("candles", [])
             if candles:
-                # Return the close price of the first candle
-                return float(candles[0][4])
+                return float(candles[0][4])  # close price
         except Exception:
             logger.debug("Could not fetch historical candle for %s", groww_symbol)
 
@@ -171,7 +191,6 @@ class BacktestEngine:
         signal_id: int,
         msg_time: datetime,
     ) -> None:
-        """Simulate a trade for the given signal."""
         if isinstance(signal, EntrySignal):
             await self._simulate_entry(signal, signal_id, msg_time)
         elif isinstance(signal, ExitSignal):
@@ -182,22 +201,17 @@ class BacktestEngine:
     async def _simulate_entry(
         self, signal: EntrySignal, signal_id: int, msg_time: datetime
     ) -> None:
-        # Try to get the actual market price at the time of the signal
         loop = asyncio.get_running_loop()
         hist_price = await loop.run_in_executor(
             None,
             lambda: self._get_historical_price(
-                signal.underlying,
-                signal.expiry_day,
-                signal.expiry_month,
-                signal.strike_price,
-                signal.option_type.value,
-                msg_time,
+                signal.underlying, signal.expiry_day, signal.expiry_month,
+                signal.strike_price, signal.option_type.value, msg_time,
             ),
         )
 
         fill_price = hist_price if hist_price is not None else signal.entry_price
-        quantity = self._settings.default_lot_multiplier  # simplified for backtest
+        quantity = self._settings.default_lot_multiplier
 
         ts = (
             f"{signal.underlying}{signal.expiry_day:02d}"
@@ -221,57 +235,54 @@ class BacktestEngine:
         )
 
         logger.info(
-            "[BT] ENTRY %s x%d @ ₹%.2f (signal: ₹%.2f)",
+            "[BT] ENTRY %s x%d @ ₹%.2f (signal: ₹%.2f, SL: %s, T: %s)",
             signal.display_name, quantity, fill_price, signal.entry_price,
+            signal.stoploss, signal.targets,
         )
 
     async def _simulate_exit(
         self, signal: ExitSignal, signal_id: int, msg_time: datetime
     ) -> None:
-        position = await self._db.find_open_position(
-            underlying=signal.underlying,
-            strike_price=signal.strike_price,
-            option_type=signal.option_type.value if signal.option_type else None,
-            expiry_day=signal.expiry_day,
-            expiry_month=signal.expiry_month,
-        )
+        position = await self._find_matching_position(signal)
         if position is None:
-            positions = await self._db.find_all_open_positions_for_underlying(
-                signal.underlying
-            )
-            if not positions:
-                logger.debug("[BT] No open position for EXIT %s", signal.display_name)
-                return
-            position = positions[0]
+            logger.debug("[BT] No open position for EXIT %s", signal.display_name)
+            return
 
-        # Try historical price
-        loop = asyncio.get_running_loop()
-        hist_price = None
-        if position.get("strike_price") and position.get("option_type"):
-            hist_price = await loop.run_in_executor(
-                None,
-                lambda: self._get_historical_price(
-                    position["underlying"],
-                    position.get("expiry_day", 1),
-                    position.get("expiry_month", "JAN"),
-                    position["strike_price"],
-                    position["option_type"],
-                    msg_time,
-                ),
-            )
-
-        exit_price = hist_price if hist_price is not None else position["avg_entry_price"]
+        exit_price = await self._resolve_exit_price(position, msg_time)
         pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
         await self._db.close_position(position["id"], pnl=pnl)
 
         logger.info(
-            "[BT] EXIT %s @ ₹%.2f  P&L: ₹%.2f",
-            position["trading_symbol"], exit_price, pnl,
+            "[BT] EXIT %s  entry=₹%.2f  exit=₹%.2f  P&L=₹%.2f",
+            position["trading_symbol"], position["avg_entry_price"], exit_price, pnl,
         )
 
     async def _simulate_book_profit(
         self, signal: BookProfitSignal, signal_id: int, msg_time: datetime
     ) -> None:
+        position = await self._find_matching_position(signal)
+        if position is None:
+            logger.debug("[BT] No open position for BOOK_PROFIT %s", signal.display_name)
+            return
+
+        # Book profit signals often include an explicit exit price
+        if signal.exit_price is not None:
+            exit_price = signal.exit_price
+        else:
+            exit_price = await self._resolve_exit_price(position, msg_time)
+
+        pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
+        await self._db.close_position(position["id"], pnl=pnl)
+
+        logger.info(
+            "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f  P&L=₹%.2f",
+            position["trading_symbol"], position["avg_entry_price"], exit_price, pnl,
+        )
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    async def _find_matching_position(self, signal: ExitSignal | BookProfitSignal) -> Optional[dict]:
+        """Find the best matching open position for an exit/book-profit signal."""
         position = await self._db.find_open_position(
             underlying=signal.underlying,
             strike_price=signal.strike_price,
@@ -279,39 +290,83 @@ class BacktestEngine:
             expiry_day=signal.expiry_day,
             expiry_month=signal.expiry_month,
         )
-        if position is None:
-            positions = await self._db.find_all_open_positions_for_underlying(
-                signal.underlying
-            )
-            if not positions:
-                logger.debug("[BT] No open position for BOOK_PROFIT %s", signal.display_name)
-                return
-            position = positions[0]
+        if position is not None:
+            return position
 
-        if signal.exit_price is not None:
-            exit_price = signal.exit_price
-        else:
-            # Try historical
+        # Broader match — just by underlying
+        positions = await self._db.find_all_open_positions_for_underlying(signal.underlying)
+        return positions[0] if positions else None
+
+    async def _resolve_exit_price(
+        self, position: dict, msg_time: datetime
+    ) -> float:
+        """Determine the exit price for a position, trying multiple sources.
+
+        Priority:
+        1. Groww historical candle price at the exit time
+        2. First target from the entry signal (if available)
+        3. Entry price (break-even, last resort)
+        """
+        # Try historical price from Groww
+        if position.get("strike_price") and position.get("option_type"):
             loop = asyncio.get_running_loop()
-            hist_price = None
-            if position.get("strike_price") and position.get("option_type"):
-                hist_price = await loop.run_in_executor(
-                    None,
-                    lambda: self._get_historical_price(
-                        position["underlying"],
-                        position.get("expiry_day", 1),
-                        position.get("expiry_month", "JAN"),
-                        position["strike_price"],
-                        position["option_type"],
-                        msg_time,
-                    ),
-                )
-            exit_price = hist_price if hist_price is not None else position["avg_entry_price"]
+            hist_price = await loop.run_in_executor(
+                None,
+                lambda: self._get_historical_price(
+                    position["underlying"],
+                    position.get("expiry_day") or 1,
+                    position.get("expiry_month") or "JAN",
+                    position["strike_price"],
+                    position["option_type"],
+                    msg_time,
+                ),
+            )
+            if hist_price is not None:
+                return hist_price
 
-        pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
-        await self._db.close_position(position["id"], pnl=pnl)
+        # Try first target from the entry
+        targets_raw = position.get("targets")
+        if targets_raw:
+            try:
+                targets = json.loads(targets_raw) if isinstance(targets_raw, str) else targets_raw
+                if targets and len(targets) > 0:
+                    return float(targets[0])
+            except (json.JSONDecodeError, TypeError, IndexError):
+                pass
+
+        # Last resort: break-even at entry price
+        return float(position["avg_entry_price"])
+
+    async def _close_orphaned_positions(self) -> None:
+        """Force-close any positions that were never explicitly exited.
+
+        Uses stoploss price if available (worst-case scenario), otherwise
+        entry price (break-even).
+        """
+        open_positions = await self._db.get_all_positions(status="OPEN")
+        if not open_positions:
+            return
 
         logger.info(
-            "[BT] BOOK_PROFIT %s @ ₹%.2f  P&L: ₹%.2f",
-            position["trading_symbol"], exit_price, pnl,
+            "Force-closing %d orphaned positions (no exit signal received)",
+            len(open_positions),
         )
+
+        for pos in open_positions:
+            entry = pos["avg_entry_price"]
+            stoploss = pos.get("stoploss")
+
+            if stoploss is not None and stoploss > 0:
+                # Assume worst case — hit stoploss
+                exit_price = stoploss
+            else:
+                # No stoploss info — assume break-even
+                exit_price = entry
+
+            pnl = (exit_price - entry) * pos["quantity"]
+            await self._db.close_position(pos["id"], pnl=pnl)
+
+            logger.info(
+                "[BT] FORCE-CLOSE %s  entry=₹%.2f  exit=₹%.2f (SL)  P&L=₹%.2f",
+                pos["trading_symbol"], entry, exit_price, pnl,
+            )

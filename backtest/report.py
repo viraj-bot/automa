@@ -24,7 +24,22 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
 
     overview.add_row("Messages analysed", str(summary.get("total_messages", 0)))
     overview.add_row("Signals parsed", str(summary.get("total_signals", 0)))
-    overview.add_row("Duplicates skipped", str(summary.get("skipped_duplicates", 0)))
+
+    entries = summary.get("entries", 0)
+    exits = summary.get("exits", 0)
+    bps = summary.get("book_profits", 0)
+    overview.add_row("  Entry signals", f"[green]{entries}[/green]")
+    overview.add_row("  Exit signals", f"[yellow]{exits}[/yellow]")
+    overview.add_row("  Book profit signals", f"[cyan]{bps}[/cyan]")
+
+    errors = summary.get("errors", 0)
+    if errors:
+        overview.add_row("  Errors", f"[red]{errors}[/red]")
+
+    orphaned = summary.get("orphaned_positions", 0)
+    if orphaned:
+        overview.add_row("  Orphaned (force-closed)", f"[dim]{orphaned}[/dim]")
+
     console.print(overview)
     console.print()
 
@@ -36,8 +51,8 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
         )
         return
 
-    wins = summary.get("wins", 0)
-    losses = summary.get("losses", 0)
+    wins = summary.get("wins", 0) or 0
+    losses = summary.get("losses", 0) or 0
     win_rate = (wins / total * 100) if total else 0
 
     stats = Table(title="Trade Statistics", show_header=False, box=None, padding=(0, 2))
@@ -48,6 +63,15 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     stats.add_row("Winning trades", f"[green]{wins}[/green]")
     stats.add_row("Losing trades", f"[red]{losses}[/red]")
     stats.add_row("Win rate", f"{win_rate:.1f}%")
+
+    if wins > 0 and losses > 0:
+        # Profit factor = gross profit / gross loss
+        total_pnl = summary.get("total_pnl", 0) or 0
+        best = summary.get("best_trade", 0) or 0
+        worst = abs(summary.get("worst_trade", 0) or 0)
+        if worst > 0:
+            stats.add_row("Risk/Reward (best/worst)", f"{best / worst:.2f}")
+
     console.print(stats)
     console.print()
 
