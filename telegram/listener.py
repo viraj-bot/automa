@@ -1,0 +1,120 @@
+"""Real-time Telegram group message listener using Telethon."""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from telethon import TelegramClient, events
+
+from broker.base import BrokerInterface
+from config.settings import Settings
+from parser.models import TradeSignal
+from parser.signal_parser import SignalParser
+from storage.db import Database
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramListener:
+    """Connects to Telegram as a user account and listens for new messages
+    in the configured group.  Each message is parsed and, if it contains a
+    valid trade signal, forwarded to the broker for execution.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        parser: SignalParser,
+        broker: BrokerInterface,
+        db: Database,
+    ) -> None:
+        self._settings = settings
+        self._parser = parser
+        self._broker = broker
+        self._db = db
+        self._client: Optional[TelegramClient] = None
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Create the Telethon client, register the handler, and start listening."""
+        self._client = TelegramClient(
+            self._settings.session_path,
+            self._settings.telegram_api_id,
+            self._settings.telegram_api_hash,
+        )
+
+        # Register the new-message handler *before* starting
+        self._client.on(events.NewMessage(chats=self._settings.telegram_group_id))(
+            self._on_new_message
+        )
+
+        await self._client.start()
+        me = await self._client.get_me()
+        logger.info(
+            "Telegram listener started as %s (id=%s) — watching group %s",
+            me.first_name if me else "?",
+            me.id if me else "?",
+            self._settings.telegram_group_id,
+        )
+
+    async def run_forever(self) -> None:
+        """Block until the client disconnects."""
+        if self._client is None:
+            raise RuntimeError("Call start() before run_forever()")
+        logger.info("Listening for trade signals … (Ctrl+C to stop)")
+        await self._client.run_until_disconnected()
+
+    async def stop(self) -> None:
+        if self._client:
+            await self._client.disconnect()
+            logger.info("Telegram listener stopped")
+
+    # ── Event handler ────────────────────────────────────────────────────
+
+    async def _on_new_message(self, event: events.NewMessage.Event) -> None:
+        """Called for every new message in the target group."""
+        text: str = event.message.text or ""
+        if not text.strip():
+            return
+
+        msg_id = event.message.id
+        timestamp = event.message.date
+
+        logger.debug("New message [%d]: %s", msg_id, text[:120])
+
+        # Parse
+        signal: Optional[TradeSignal] = self._parser.parse(
+            text, message_id=msg_id, timestamp=timestamp
+        )
+        if signal is None:
+            return  # not a trade signal
+
+        logger.info(
+            "Parsed %s signal: %s",
+            signal.signal_type.value,
+            signal.display_name,
+        )
+
+        # Idempotency check
+        if await self._db.is_signal_processed(signal.signal_hash):
+            logger.info("Signal already processed (hash=%s), skipping", signal.signal_hash)
+            return
+
+        # Persist signal
+        try:
+            signal_id = await self._db.insert_signal(signal)
+        except Exception:
+            logger.exception("Failed to insert signal into DB")
+            return
+
+        # Execute via broker
+        try:
+            await self._broker.execute(signal, signal_id)
+        except Exception:
+            logger.exception("Broker execution failed for signal %s", signal.signal_hash)
+            return
+
+        # Mark processed
+        await self._db.mark_signal_processed(signal.signal_hash)

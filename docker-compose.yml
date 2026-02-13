@@ -1,0 +1,17 @@
+services:
+  automa:
+    build: .
+    container_name: automa-trade-bot
+    env_file:
+      - .env
+    volumes:
+      # Persist SQLite database and Telethon session across restarts
+      - automa-data:/app/data
+    restart: unless-stopped
+    # Override command via environment or CLI:
+    #   docker compose run automa python main.py --mode live
+    #   docker compose run automa python main.py --mode backtest --days 30
+    command: ["python", "main.py"]
+
+volumes:
+  automa-data:
