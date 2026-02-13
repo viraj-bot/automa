@@ -51,6 +51,12 @@ class TelegramListener:
         )
 
         await self._client.start()
+
+        # Fetch dialogs so Telethon caches the entity for the numeric group ID.
+        # Without this, numeric IDs fail with "Could not find the input entity".
+        logger.info("Loading dialogs to resolve group entity …")
+        await self._client.get_dialogs()
+
         me = await self._client.get_me()
         logger.info(
             "Telegram listener started as %s (id=%s) — watching group %s",

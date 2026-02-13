@@ -44,6 +44,11 @@ async def fetch_chat_history(
     await client.start()
     logger.info("Connected to Telegram for history fetch")
 
+    # Fetch dialogs first so Telethon caches the entity for the group ID.
+    # Without this, numeric IDs fail with "Could not find the input entity".
+    logger.info("Loading dialogs to resolve group entity …")
+    await client.get_dialogs()
+
     offset_date = datetime.now(tz=timezone.utc) - timedelta(days=days)
     messages: list[dict] = []
 
