@@ -1,9 +1,10 @@
 """Regex-based parser that converts raw Telegram messages into structured trade signals.
 
-Handles three signal types:
-  1. ENTRY  – "Buy NIFTY50 17 FEB 25600 PE at 135"
-  2. EXIT   – "Exit Nifty50 17 FEB 25600 PE"
+Handles four signal types:
+  1. ENTRY       – "Buy NIFTY50 17 FEB 25600 PE at 135"
+  2. EXIT        – "Exit Nifty50 17 FEB 25600 PE at the current price 72.5"
   3. BOOK_PROFIT – "Book Profit in INDHOTEL 24 FEB 690 CE at price 17.2"
+  4. PARTIAL BP  – "Book partial profit in PERSISTENT 27 JAN 6400 CE at 226.99"
 
 The parser is intentionally lenient: it strips emojis, normalises whitespace,
 and tries multiple regex patterns so that slight wording variations still match.
@@ -59,29 +60,41 @@ _MONTHS = {
 _MONTH_PATTERN = "|".join(_MONTHS.keys())
 
 # ── Words that must NOT be captured as the underlying symbol ──
-# These are action/filler keywords that precede the real instrument name.
 _ACTION_WORDS = (
     "BUY", "SELL", "SHORT", "LONG", "EXIT", "EXITED", "CLOSE", "CLOSED",
     "BOOK", "BOOKED", "PROFIT", "TAKE", "TRAIL", "TRAILING", "PARTIAL",
     "NEW", "FRESH", "ENTER", "ENTRY", "INITIATE", "ADD",
     "PLEASE", "FROM", "IN", "ON", "AT", "THE", "OF", "FOR",
-    "OPTION", "TRADE", "OPTION TRADE",
-    "GO", "GET", "OUT", "SQUARE", "SQUARED",
+    "OPTION", "TRADE", "OPTION TRADE", "FULL",
+    "GO", "GET", "OUT", "SQUARE", "SQUARED", "REMAINING",
+    "TARGET", "HIT",
 )
 _ACTION_WORDS_SET = frozenset(_ACTION_WORDS)
 
+# ── Noise / non-trade message filter ──
+_NOISE_PATTERNS = re.compile(
+    r"(?:"
+    r"ADD\s+T(?:O|)\s*WATCHLIS|"          # ADD TO WATCHLIST (incl typos)
+    r"WATCHLIST|"
+    r"Pre-Market\s+Update|"
+    r"Post-Market\s+Report|"
+    r"POST\s+MARKET\s+REPORT|"
+    r"AVOID\s+THE\s+TRADE|"
+    r"Entry\s+Missed|"
+    r"GIFT\s+Nifty|"
+    r"Trade\s+Performance|"
+    r"Market\s+Close|"
+    r"Market\s+Snapshot|"
+    r"COMMODITY\s+UPDATE|"
+    r"MCX\s+Crude|"
+    r"Union\s+Budget|"
+    r"Hold\s+for\s+next\s+trading|"
+    r"Hold\s+the\s+position"
+    r")",
+    re.IGNORECASE,
+)
+
 # ── Instrument pattern (shared across signal types) ──
-# Matches: NIFTY50 17 FEB 25600 PE  or  INDHOTEL 24 FEB 690 CE
-#          BANK NIFTY 17 FEB 25600 PE  (two-word underlyings)
-# Groups:  underlying, day, month, strike, option_type
-# The underlying group allows an optional second word so that
-# "BANK NIFTY", "FIN NIFTY" etc. are captured as a single group
-# and later normalised via _normalize_underlying().
-#
-# IMPORTANT: A raw regex alone cannot exclude action keywords from the
-# underlying group reliably (negative lookahead for variable-length
-# alternations is fragile).  Instead, we use a broad regex and post-filter
-# the captured underlying in _clean_underlying().
 _INSTRUMENT_RE = re.compile(
     r"(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)\s+"
     r"(?P<day>\d{1,2})\s+"
@@ -93,25 +106,12 @@ _INSTRUMENT_RE = re.compile(
 
 
 def _clean_underlying(raw_match: str, full_text: str, match_start: int) -> str:
-    """Strip leading action keywords from a captured underlying group.
-
-    The instrument regex may capture "BUY NIFTY50" or "EXIT INDHOTEL" as the
-    underlying because the two-word pattern is greedy.  This function peels
-    off the first word if it is a known action keyword, leaving just the real
-    instrument name (e.g. "NIFTY50", "INDHOTEL", "BANK NIFTY").
-
-    It also looks *backwards* in the text for an additional preceding word
-    that might be part of a two-word underlying (e.g. if the regex only
-    captured "NIFTY" but "BANK" precedes it).
-    """
+    """Strip leading action keywords from a captured underlying group."""
     parts = raw_match.strip().split()
 
-    # If the first word is an action keyword, drop it
     while len(parts) > 1 and parts[0].upper() in _ACTION_WORDS_SET:
         parts = parts[1:]
 
-    # If we're left with a single word, check if the word before the match
-    # in the original text forms a two-word underlying (e.g. "BANK" before "NIFTY")
     if len(parts) == 1:
         prefix_text = full_text[:match_start].rstrip()
         if prefix_text:
@@ -123,21 +123,69 @@ def _clean_underlying(raw_match: str, full_text: str, match_start: int) -> str:
 
     return " ".join(parts)
 
+
 # ── Price extraction helpers ──
+
 _RUPEE_PRICE_RE = re.compile(
     r"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# ── Target extraction regexes (multiple strategies) ──
+# ── Exit price patterns (specific to EXIT messages) ──
 
-# Strategy 1: Labelled targets like "target 1: 185", "T1: 185", "tgt1 - 185"
+# "at the current price ₹72.5" or "at the current price: ₹72.5"
+_EXIT_CURRENT_PRICE_RE = re.compile(
+    r"(?:at\s+the\s+)?current\s+price\s*[:=]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# "at cost to cost ₹30.6" or "cost-to-cost ₹30.6"
+_EXIT_CTC_PRICE_RE = re.compile(
+    r"(?:at\s+)?cost\s*(?:to|2)\s*cost\s*[:=]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# "Exit Remaining quantity at ₹31.15"
+_EXIT_REMAINING_PRICE_RE = re.compile(
+    r"(?:exit\s+)?remaining\s+(?:quantity|qty)\s+at\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Generic "at ₹<price>" or "at price ₹<price>" — used as last resort for exits
+_EXIT_AT_PRICE_RE = re.compile(
+    r"\bat\s+(?:price\s+)?(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _extract_exit_price(text: str) -> Optional[float]:
+    """Extract exit price from an EXIT or BOOK_PROFIT message.
+
+    Tries patterns in order of specificity:
+    1. "at the current price ₹72.5"
+    2. "at cost to cost ₹30.6"
+    3. "Exit Remaining quantity at ₹31.15"
+    4. "at price ₹237" / "at ₹237"
+    """
+    for pattern in (
+        _EXIT_CURRENT_PRICE_RE,
+        _EXIT_CTC_PRICE_RE,
+        _EXIT_REMAINING_PRICE_RE,
+        _EXIT_AT_PRICE_RE,
+    ):
+        m = pattern.search(text)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+# ── Target extraction regexes ──
+
 _TARGET_LABELLED_RE = re.compile(
     r"\b(?:target|tgt|tp)\s*(\d{1,2})\s*[:=\-–—]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# Strategy 2: List format like "targets: ₹60 / ₹90 / ₹120" or "tgt: 60, 90, 120"
 _TARGET_LIST_RE = re.compile(
     r"(?:targets?|tgt|tp)\s*[:=\-–—]\s*"
     r"((?:(?:₹|rs\.?|inr)?\s*\d+(?:\.\d+)?\s*[/,\s]\s*)*"
@@ -145,18 +193,15 @@ _TARGET_LIST_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Strategy 3: "target 185" or "tgt 185" (keyword followed directly by price, no number)
 _TARGET_BARE_RE = re.compile(
     r"(?:target|tgt)\s+(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# Strategy 4: Emoji-based targets like "🎯 185" or "🎯185/235"
 _TARGET_EMOJI_RE = re.compile(
     r"🎯\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
 )
 
-# Extracts individual numeric values from a matched target-list string.
 _PRICE_IN_LIST_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
 _STOPLOSS_RE = re.compile(
@@ -164,7 +209,6 @@ _STOPLOSS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Emoji-based stoploss: "🛑 90" or "❌ 90"
 _STOPLOSS_EMOJI_RE = re.compile(
     r"[🛑❌⛔]\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
 )
@@ -176,24 +220,11 @@ def _clean_text(text: str) -> str:
     text = text.replace("**", "")           # strip Telegram markdown bold
     text = text.replace("__", "")           # strip Telegram markdown italic
     text = text.replace("``", "")           # strip Telegram markdown code
-    text = re.sub(r"https?://\S+", " ", text)  # strip URLs to avoid false matches
+    text = re.sub(r"https?://\S+", " ", text)  # strip URLs
     text = re.sub(r"[^\S\n]+", " ", text)   # collapse horizontal whitespace
     return text.strip()
 
 
-def _extract_price_after(text: str, keyword: str) -> Optional[float]:
-    """Find a price value that appears after *keyword* in the text."""
-    pattern = re.compile(
-        rf"{re.escape(keyword)}\s*(?:at|@|:)?\s*(?:₹|rs\.?|inr|price)?\s*(\d+(?:\.\d+)?)",
-        re.IGNORECASE,
-    )
-    m = pattern.search(text)
-    if m:
-        return float(m.group(1))
-    return None
-
-
-# Additional price-keyword patterns for entry price extraction
 _CMP_PRICE_RE = re.compile(
     r"(?:cmp|around|near|above|below)\s*(?:at|@|[:=\-])?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
@@ -206,21 +237,11 @@ _RANGE_PRICE_RE = re.compile(
 
 
 def _extract_targets(text: str) -> list[float]:
-    """Extract all target prices from the text.
-
-    Tries multiple strategies in order of specificity:
-      1. Labelled:  "target 1: 185", "T1: 185", "tgt1 - 185"
-      2. List:      "targets: ₹60 / ₹90 / ₹120" or "tgt: 60, 90, 120"
-      3. Bare:      "target 185" (keyword + price, no number)
-      4. Emoji:     "🎯 185"
-    """
-    # Strategy 1: labelled targets  (target 1: 185, T1: 185, …)
-    # group(1) = target number, group(2) = price
+    """Extract all target prices from the text."""
     labelled = [float(m.group(2)) for m in _TARGET_LABELLED_RE.finditer(text)]
     if labelled:
         return labelled
 
-    # Strategy 2: single keyword followed by a comma/slash-separated price list
     list_match = _TARGET_LIST_RE.search(text)
     if list_match:
         raw_list = list_match.group(1)
@@ -228,12 +249,10 @@ def _extract_targets(text: str) -> list[float]:
         if prices:
             return prices
 
-    # Strategy 3: bare "target 185" without a number
     bare = [float(m.group(1)) for m in _TARGET_BARE_RE.finditer(text)]
     if bare:
         return bare
 
-    # Strategy 4: emoji-based "🎯 185"
     emoji_targets = [float(m.group(1)) for m in _TARGET_EMOJI_RE.finditer(text)]
     if emoji_targets:
         return emoji_targets
@@ -245,7 +264,6 @@ def _extract_stoploss(text: str) -> Optional[float]:
     m = _STOPLOSS_RE.search(text)
     if m:
         return float(m.group(1))
-    # Try emoji-based stoploss
     m = _STOPLOSS_EMOJI_RE.search(text)
     if m:
         return float(m.group(1))
@@ -266,14 +284,31 @@ _ENTRY_KEYWORDS = re.compile(
 
 _EXIT_KEYWORDS = re.compile(
     r"\b(exit|exited|close|closed|square\s*off|squared\s+off|"
-    r"please\s+exit|exit\s+from|get\s+out|out\s+of)\b",
+    r"please\s+exit|exit\s+from|get\s+out|out\s+of|"
+    r"exit\s+remaining|remaining\s+quantity)\b",
     re.IGNORECASE,
 )
 
 _BOOK_PROFIT_KEYWORDS = re.compile(
     r"\b(book\s+prof(?:it|t)|booked\s+prof(?:it|t)|profit\s+booked|"
     r"partial\s+profit|partial\s+exit|trail\s+sl|trailing\s+sl|"
-    r"book\s+partial|take\s+profit)\b",
+    r"book\s+partial|take\s+profit|target\s+\d+\s+hit|"
+    r"book\s+full\s+profit)\b",
+    re.IGNORECASE,
+)
+
+# ── Partial vs full book-profit detection ──
+
+_PARTIAL_INDICATORS = re.compile(
+    r"(?:partial\s+profit|book\s+partial|partial\s+lot|"
+    r"target\s+1\s+(?:hit|reached)|move\s+(?:your\s+)?stop\s*loss\s+to\s+(?:your\s+)?cost|"
+    r"hold\s+the\s+remaining|remaining\s+quantity)",
+    re.IGNORECASE,
+)
+
+_FULL_INDICATORS = re.compile(
+    r"(?:book\s+full\s+profit|target\s+2\s+(?:hit|reached)|"
+    r"book\s+profit\s+now|full\s+profit)",
     re.IGNORECASE,
 )
 
@@ -296,19 +331,26 @@ class SignalParser:
         if not text or len(text) < 5:
             return None
 
+        # ── Noise filter: skip non-trade messages early ──
+        if _NOISE_PATTERNS.search(text):
+            return None
+
         cleaned = _clean_text(text)
 
         # Determine signal type by keyword priority:
         # BOOK_PROFIT > EXIT > ENTRY  (book-profit messages may also contain "exit")
-        if _BOOK_PROFIT_KEYWORDS.search(cleaned):
+        #
+        # Special case: "Exit Remaining quantity" messages mention "partial profit"
+        # as a note ("Partial profit already booked earlier") but are actually EXIT
+        # signals.  Check for "exit remaining" before book-profit keywords.
+        has_exit_remaining = bool(re.search(
+            r"exit\s+remaining", cleaned, re.IGNORECASE
+        ))
+        if _BOOK_PROFIT_KEYWORDS.search(cleaned) and not has_exit_remaining:
             return self._parse_book_profit(cleaned, text, message_id, timestamp)
         if _EXIT_KEYWORDS.search(cleaned):
             return self._parse_exit(cleaned, text, message_id, timestamp)
         if _ENTRY_KEYWORDS.search(cleaned):
-            return self._parse_entry(cleaned, text, message_id, timestamp)
-
-        # Fallback: if the message contains instrument details + a price, treat as entry
-        if _INSTRUMENT_RE.search(cleaned) and _RUPEE_PRICE_RE.search(cleaned):
             return self._parse_entry(cleaned, text, message_id, timestamp)
 
         return None
@@ -334,32 +376,38 @@ class SignalParser:
         strike = float(m.group("strike"))
         otype = OptionType(m.group("otype").upper())
 
-        # Extract entry price — look for "at <price>" after the instrument block
-        entry_price = _extract_price_after(cleaned[m.end():], "")
+        # Extract entry price — try multiple patterns
+        entry_price = None
+        after_instrument = cleaned[m.end():]
+
+        # "at ₹135" or "above ₹246" right after instrument
+        at_m = re.search(
+            r"(?:at|above|below|@)\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+            after_instrument,
+            re.IGNORECASE,
+        )
+        if at_m:
+            entry_price = float(at_m.group(1))
+
         if entry_price is None:
-            # Try "at ₹135" anywhere
-            entry_price = _extract_price_after(cleaned, "at")
-        if entry_price is None:
-            # Try "@ 135"
-            entry_price = _extract_price_after(cleaned, "@")
-        if entry_price is None:
-            # Try "CMP 135", "around 135", "near 135", etc.
+            # Try "CMP 135", "around 135", "near 135"
             cmp_m = _CMP_PRICE_RE.search(cleaned)
             if cmp_m:
                 entry_price = float(cmp_m.group(1))
+
         if entry_price is None:
             # Try "135-140 range" — use midpoint
-            range_m = _RANGE_PRICE_RE.search(cleaned[m.end():])
+            range_m = _RANGE_PRICE_RE.search(after_instrument)
             if range_m:
                 lo = float(range_m.group(1))
                 hi = float(range_m.group(2))
                 entry_price = (lo + hi) / 2
+
         if entry_price is None:
             logger.debug("ENTRY signal but no price found: %s", cleaned[:80])
             return None
 
-        # Try extracting targets/SL from cleaned text first, then raw text
-        # (raw text preserves emojis that _clean_text strips)
+        # Extract targets/SL from cleaned text first, then raw text
         targets = _extract_targets(cleaned) or _extract_targets(raw)
         stoploss = _extract_stoploss(cleaned) or _extract_stoploss(raw)
 
@@ -384,10 +432,10 @@ class SignalParser:
         message_id: Optional[int],
         timestamp: Optional[datetime],
     ) -> Optional[ExitSignal]:
-        m = _INSTRUMENT_RE.search(cleaned)
+        # Extract exit price from the message
+        exit_price = _extract_exit_price(cleaned)
 
-        # Even without full instrument details, try to extract just the underlying
-        # e.g. "Please exit from NIFTY50 17 FEB"
+        m = _INSTRUMENT_RE.search(cleaned)
         if m:
             underlying = _normalize_underlying(
                 _clean_underlying(m.group("underlying"), cleaned, m.start())
@@ -398,12 +446,13 @@ class SignalParser:
                 expiry_month=_normalise_month(m.group("month")),
                 strike_price=float(m.group("strike")),
                 option_type=OptionType(m.group("otype").upper()),
+                exit_price=exit_price,
                 raw_text=raw,
                 message_id=message_id,
                 timestamp=timestamp,
             )
 
-        # Partial match: "Exit NIFTY50 17 FEB" or "Exit BANK NIFTY 17 FEB"
+        # Partial match: "Exit NIFTY50 17 FEB"
         partial = re.search(
             r"(?:exit|close|square\s*off|exited|closed|squared\s+off|out\s+of)"
             r"\s+(?:from\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)"
@@ -421,6 +470,7 @@ class SignalParser:
                 underlying=underlying,
                 expiry_day=day,
                 expiry_month=month,
+                exit_price=exit_price,
                 raw_text=raw,
                 message_id=message_id,
                 timestamp=timestamp,
@@ -438,12 +488,15 @@ class SignalParser:
     ) -> Optional[BookProfitSignal]:
         m = _INSTRUMENT_RE.search(cleaned)
 
-        # Try to extract exit price
-        exit_price = _extract_price_after(cleaned, "price")
-        if exit_price is None:
-            exit_price = _extract_price_after(cleaned, "at")
-        if exit_price is None:
-            exit_price = _extract_price_after(cleaned, "@")
+        # Extract exit price
+        exit_price = _extract_exit_price(cleaned)
+
+        # Detect partial vs full
+        is_partial = False
+        if _PARTIAL_INDICATORS.search(cleaned):
+            is_partial = True
+        if _FULL_INDICATORS.search(cleaned):
+            is_partial = False  # explicit "full" overrides partial
 
         if m:
             underlying = _normalize_underlying(
@@ -456,15 +509,17 @@ class SignalParser:
                 strike_price=float(m.group("strike")),
                 option_type=OptionType(m.group("otype").upper()),
                 exit_price=exit_price,
+                is_partial=is_partial,
                 raw_text=raw,
                 message_id=message_id,
                 timestamp=timestamp,
             )
 
-        # Partial: "Book Profit in INDHOTEL 24 FEB" or "Booked profit BANK NIFTY"
+        # Partial match: "Book Profit in INDHOTEL 24 FEB"
         partial = re.search(
-            r"(?:book(?:ed)?\s+prof(?:it|t)|take\s+profit|profit\s+booked|partial\s+exit)"
-            r"\s+(?:in\s+|on\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)"
+            r"(?:book(?:ed)?\s+(?:partial\s+)?prof(?:it|t)|take\s+profit|"
+            r"profit\s+booked|partial\s+exit|book\s+full\s+profit)"
+            r"\s+(?:in\s+|on\s+|for\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)"
             r"(?:\s+(?P<day>\d{1,2})\s+(?P<month>" + _MONTH_PATTERN + r"))?",
             cleaned,
             re.IGNORECASE,
@@ -480,6 +535,7 @@ class SignalParser:
                 expiry_day=day,
                 expiry_month=month,
                 exit_price=exit_price,
+                is_partial=is_partial,
                 raw_text=raw,
                 message_id=message_id,
                 timestamp=timestamp,

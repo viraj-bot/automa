@@ -92,6 +92,7 @@ class ExitSignal:
     expiry_month: Optional[str] = None
     strike_price: Optional[float] = None
     option_type: Optional[OptionType] = None
+    exit_price: Optional[float] = None
     raw_text: str = ""
     message_id: Optional[int] = None
     timestamp: Optional[datetime] = None
@@ -126,6 +127,7 @@ class BookProfitSignal:
     strike_price: Optional[float] = None
     option_type: Optional[OptionType] = None
     exit_price: Optional[float] = None
+    is_partial: bool = False
     raw_text: str = ""
     message_id: Optional[int] = None
     timestamp: Optional[datetime] = None

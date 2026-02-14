@@ -572,9 +572,16 @@ class BacktestEngine:
 
         entry_price = float(position["avg_entry_price"])
         quantity = int(position["quantity"])
-        exit_price, exit_source = await self._resolve_exit_price(
-            position, msg_time, close_reason="EXIT",
-        )
+
+        # Prefer the explicit exit price from the signal (e.g. "at the current price ₹72.5")
+        if signal.exit_price is not None:
+            exit_price = float(signal.exit_price)
+            exit_source = "signal"
+        else:
+            exit_price, exit_source = await self._resolve_exit_price(
+                position, msg_time, close_reason="EXIT",
+            )
+
         pnl = (exit_price - entry_price) * quantity
         await self._db.close_position(position["id"], pnl=pnl)
 
@@ -631,29 +638,87 @@ class BacktestEngine:
                 position, msg_time, close_reason="BOOK_PROFIT",
             )
 
-        pnl = (exit_price - entry_price) * quantity
-        await self._db.close_position(position["id"], pnl=pnl)
+        # ── Handle partial vs full book-profit ──
+        if signal.is_partial:
+            # Close ~50% of the position, keep the rest open
+            close_qty = quantity // 2
+            if close_qty <= 0:
+                close_qty = quantity  # if only 1 lot, close it all
 
-        exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
-        self._trade_log.append({
-            "trade_no": len(self._trade_log) + 1,
-            "instrument": position["trading_symbol"],
-            "underlying": position["underlying"],
-            "qty": quantity,
-            "entry_price": entry_price,
-            "entry_source": "signal",
-            "exit_price": exit_price,
-            "exit_source": exit_source,
-            "close_type": "BOOK_PROFIT",
-            "pnl": pnl,
-            "entry_time": self._entry_times.get(position["trading_symbol"], ""),
-            "exit_time": exit_time_str,
-        })
+            # Round to lot size if possible
+            lot_size = self._resolve_lot_size(
+                position["underlying"],
+                position.get("expiry_day") or 1,
+                position.get("expiry_month") or "JAN",
+                position.get("strike_price") or 0,
+                position.get("option_type") or "CE",
+                msg_time,
+            )
+            if lot_size > 1 and close_qty >= lot_size:
+                close_qty = (close_qty // lot_size) * lot_size
 
-        logger.info(
-            "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
-            position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
-        )
+            remaining_qty = quantity - close_qty
+            partial_pnl = (exit_price - entry_price) * close_qty
+
+            if remaining_qty > 0:
+                # Partial close: reduce quantity, keep position open
+                await self._db.partial_close_position(
+                    position["id"],
+                    close_qty=close_qty,
+                    partial_pnl=partial_pnl,
+                )
+                close_type = "PARTIAL"
+            else:
+                # Closing everything (only 1 lot or rounding ate it all)
+                await self._db.close_position(position["id"], pnl=partial_pnl)
+                close_type = "BOOK_PROFIT"
+
+            exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
+            self._trade_log.append({
+                "trade_no": len(self._trade_log) + 1,
+                "instrument": position["trading_symbol"],
+                "underlying": position["underlying"],
+                "qty": close_qty,
+                "entry_price": entry_price,
+                "entry_source": "signal",
+                "exit_price": exit_price,
+                "exit_source": exit_source,
+                "close_type": close_type,
+                "pnl": partial_pnl,
+                "entry_time": self._entry_times.get(position["trading_symbol"], ""),
+                "exit_time": exit_time_str,
+            })
+
+            logger.info(
+                "[BT] PARTIAL_BP %s  closed %d/%d @ ₹%.2f (%s)  P&L=₹%.2f  remaining=%d",
+                position["trading_symbol"], close_qty, quantity,
+                exit_price, exit_source, partial_pnl, remaining_qty,
+            )
+        else:
+            # Full book-profit: close the entire position
+            pnl = (exit_price - entry_price) * quantity
+            await self._db.close_position(position["id"], pnl=pnl)
+
+            exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
+            self._trade_log.append({
+                "trade_no": len(self._trade_log) + 1,
+                "instrument": position["trading_symbol"],
+                "underlying": position["underlying"],
+                "qty": quantity,
+                "entry_price": entry_price,
+                "entry_source": "signal",
+                "exit_price": exit_price,
+                "exit_source": exit_source,
+                "close_type": "BOOK_PROFIT",
+                "pnl": pnl,
+                "entry_time": self._entry_times.get(position["trading_symbol"], ""),
+                "exit_time": exit_time_str,
+            })
+
+            logger.info(
+                "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
+                position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
+            )
 
     async def _update_closed_position_pnl(
         self, signal: BookProfitSignal

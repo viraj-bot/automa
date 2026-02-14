@@ -321,6 +321,27 @@ class Database:
         )
         await self.conn.commit()
 
+    async def partial_close_position(
+        self,
+        position_id: int,
+        close_qty: int,
+        partial_pnl: float,
+    ) -> None:
+        """Reduce a position's quantity by *close_qty* and record partial P&L.
+
+        The position stays OPEN with the remaining quantity.  The partial P&L
+        is accumulated in the ``pnl`` column (which starts at 0 for open
+        positions).
+        """
+        await self.conn.execute(
+            """UPDATE positions
+               SET quantity = quantity - ?,
+                   pnl = COALESCE(pnl, 0) + ?
+               WHERE id = ? AND status = 'OPEN'""",
+            (close_qty, partial_pnl, position_id),
+        )
+        await self.conn.commit()
+
     async def get_all_positions(self, status: Optional[str] = None) -> list[dict[str, Any]]:
         if status:
             cursor = await self.conn.execute(

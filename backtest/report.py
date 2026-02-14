@@ -93,6 +93,7 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
             "BOOK_PROFIT": "BP",
             "EXIT": "EXIT",
             "ORPHAN": "ORPHAN",
+            "PARTIAL": "PARTIAL",
         }.get(t["close_type"], t["close_type"])
 
         entry_time = t.get("entry_time", "")
@@ -118,6 +119,7 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     wins = summary.get("wins", 0) or 0
     losses = summary.get("losses", 0) or 0
     breakeven = summary.get("breakeven", 0) or 0
+    partial_count = sum(1 for t in trade_log if t["close_type"] == "PARTIAL")
     win_rate = (wins / total * 100) if total else 0
 
     stats = Table(title="Trade Statistics", show_header=False, box=None, padding=(0, 2))
@@ -129,6 +131,8 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     stats.add_row("Losing trades", f"[red]{losses}[/red]")
     if breakeven > 0:
         stats.add_row("Break-even trades (P&L = 0)", f"[dim]{breakeven}[/dim]")
+    if partial_count > 0:
+        stats.add_row("Partial exits", f"[cyan]{partial_count}[/cyan]")
     stats.add_row("Win rate", f"{win_rate:.1f}%")
 
     if wins > 0 and losses > 0:
