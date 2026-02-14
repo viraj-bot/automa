@@ -96,10 +96,11 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     # ── Exit price source breakdown ───────────────────────────────────
     exit_groww = summary.get("exit_from_groww", 0)
     exit_target = summary.get("exit_from_target", 0)
+    exit_stoploss = summary.get("exit_from_stoploss", 0)
     exit_fallback = summary.get("exit_from_entry_fallback", 0)
     unmatched = summary.get("unmatched_close_signals", 0)
 
-    if exit_groww or exit_target or exit_fallback or unmatched:
+    if exit_groww or exit_target or exit_stoploss or exit_fallback or unmatched:
         diag = Table(
             title="Diagnostics", show_header=False, box=None, padding=(0, 2)
         )
@@ -112,13 +113,18 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
             )
         if exit_target:
             diag.add_row(
-                "Exits from target price (no market data)",
+                "Exits at target (book-profit, no market data)",
                 f"[yellow]{exit_target}[/yellow]",
+            )
+        if exit_stoploss:
+            diag.add_row(
+                "Exits at stoploss (exit/orphan, no market data)",
+                f"[red]{exit_stoploss}[/red]",
             )
         if exit_fallback:
             diag.add_row(
-                "Exits at SL/entry price (fallback, no data)",
-                f"[red]{exit_fallback}[/red]",
+                "Exits at entry price (no data, no SL)",
+                f"[dim]{exit_fallback}[/dim]",
             )
         if unmatched:
             diag.add_row(

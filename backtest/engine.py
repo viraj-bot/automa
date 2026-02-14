@@ -63,8 +63,9 @@ class BacktestEngine:
 
         # Counters for exit-price source tracking
         self._exit_from_groww = 0
-        self._exit_from_target = 0
-        self._exit_from_entry_fallback = 0
+        self._exit_from_target = 0       # book-profit exits using target price
+        self._exit_from_stoploss = 0     # exits/orphans using stoploss price
+        self._exit_from_entry_fallback = 0  # last-resort break-even at entry
         self._unmatched_close_signals = 0
 
     # ── Public API ───────────────────────────────────────────────────────
@@ -188,6 +189,7 @@ class BacktestEngine:
         # Exit-price source breakdown
         summary["exit_from_groww"] = self._exit_from_groww
         summary["exit_from_target"] = self._exit_from_target
+        summary["exit_from_stoploss"] = self._exit_from_stoploss
         summary["exit_from_entry_fallback"] = self._exit_from_entry_fallback
         summary["unmatched_close_signals"] = self._unmatched_close_signals
 
@@ -426,7 +428,9 @@ class BacktestEngine:
             self._unmatched_close_signals += 1
             return
 
-        exit_price = await self._resolve_exit_price(position, msg_time)
+        exit_price = await self._resolve_exit_price(
+            position, msg_time, close_reason="EXIT",
+        )
         pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
         await self._db.close_position(position["id"], pnl=pnl)
 
@@ -454,7 +458,9 @@ class BacktestEngine:
         if signal.exit_price is not None:
             exit_price = signal.exit_price
         else:
-            exit_price = await self._resolve_exit_price(position, msg_time)
+            exit_price = await self._resolve_exit_price(
+                position, msg_time, close_reason="BOOK_PROFIT",
+            )
 
         pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
         await self._db.close_position(position["id"], pnl=pnl)
@@ -552,19 +558,33 @@ class BacktestEngine:
         return None
 
     async def _resolve_exit_price(
-        self, position: dict, msg_time: datetime
+        self, position: dict, msg_time: datetime,
+        *, close_reason: str = "EXIT",
     ) -> float:
         """Determine the exit price for a position, trying multiple sources.
 
-        Priority:
-        1. Groww historical candle price at the exit time
-        2. First target from the entry signal (if available)
-        3. Stoploss (worst-case realistic exit)
-        4. Entry price (break-even, absolute last resort)
+        ``close_reason`` controls fallback behaviour when no market data is
+        available:
+
+        * ``"BOOK_PROFIT"`` — the signal explicitly says profit was booked,
+          so using the first target is a reasonable estimate.
+        * ``"EXIT"`` — a plain exit (could be a stop-loss hit), so we
+          conservatively use the stoploss as the fallback.
+        * ``"ORPHAN"`` — position was never explicitly closed; assume worst
+          case (stoploss).
+
+        Priority (common):
+        1. Groww historical candle price at the exit time.
+
+        Then, depending on close_reason:
+        - BOOK_PROFIT: target → stoploss → entry
+        - EXIT:        stoploss → entry
+        - ORPHAN:      stoploss → entry
         """
         ts = position.get("trading_symbol", "?")
+        entry = float(position["avg_entry_price"])
 
-        # Try historical price from Groww
+        # ── 1. Try historical price from Groww ──
         if position.get("strike_price") and position.get("option_type"):
             loop = asyncio.get_running_loop()
             hist_price = await loop.run_in_executor(
@@ -582,41 +602,59 @@ class BacktestEngine:
                 self._exit_from_groww += 1
                 return hist_price
 
-        # Try first target from the entry
+        # ── 2. Fallback depends on close_reason ──
+
+        # Parse helpers
         targets_raw = position.get("targets")
+        first_target = None
         if targets_raw:
             try:
                 targets = json.loads(targets_raw) if isinstance(targets_raw, str) else targets_raw
                 if targets and len(targets) > 0:
-                    self._exit_from_target += 1
-                    logger.info(
-                        "[BT] Exit price for %s: using first target ₹%.2f "
-                        "(no historical data available)",
-                        ts, float(targets[0]),
-                    )
-                    return float(targets[0])
+                    first_target = float(targets[0])
             except (json.JSONDecodeError, TypeError, IndexError):
                 pass
 
-        # Try stoploss as a worst-case realistic exit
         stoploss = position.get("stoploss")
-        if stoploss is not None and stoploss > 0:
-            self._exit_from_entry_fallback += 1
-            logger.info(
-                "[BT] Exit price for %s: using stoploss ₹%.2f "
-                "(no historical data, no targets)",
-                ts, float(stoploss),
-            )
-            return float(stoploss)
+        stoploss_val = float(stoploss) if stoploss is not None and float(stoploss) > 0 else None
 
-        # Last resort: break-even at entry price
+        if close_reason == "BOOK_PROFIT":
+            # Signal says profit was booked → target is a fair estimate
+            if first_target is not None:
+                self._exit_from_target += 1
+                logger.info(
+                    "[BT] Exit price for %s (BOOK_PROFIT): using first target ₹%.2f",
+                    ts, first_target,
+                )
+                return first_target
+            # No target available — try stoploss as conservative fallback
+            if stoploss_val is not None:
+                self._exit_from_stoploss += 1
+                logger.info(
+                    "[BT] Exit price for %s (BOOK_PROFIT): no target, using stoploss ₹%.2f",
+                    ts, stoploss_val,
+                )
+                return stoploss_val
+
+        else:
+            # EXIT or ORPHAN — trade may have gone wrong; use stoploss
+            if stoploss_val is not None:
+                self._exit_from_stoploss += 1
+                logger.info(
+                    "[BT] Exit price for %s (%s): using stoploss ₹%.2f "
+                    "(no historical data)",
+                    ts, close_reason, stoploss_val,
+                )
+                return stoploss_val
+
+        # ── 3. Absolute last resort: break-even at entry price ──
         self._exit_from_entry_fallback += 1
         logger.warning(
-            "[BT] Exit price for %s: falling back to entry price ₹%.2f "
-            "(no historical data, no targets, no stoploss)",
-            ts, float(position["avg_entry_price"]),
+            "[BT] Exit price for %s (%s): falling back to entry price ₹%.2f "
+            "(no historical data, no stoploss)",
+            ts, close_reason, entry,
         )
-        return float(position["avg_entry_price"])
+        return entry
 
     async def _close_orphaned_positions(self) -> None:
         """Force-close any positions that were never explicitly exited.
@@ -640,29 +678,15 @@ class BacktestEngine:
             stoploss = pos.get("stoploss")
             source = "entry (break-even)"
 
-            if stoploss is not None and stoploss > 0:
-                # Assume worst case — hit stoploss
-                exit_price = stoploss
+            if stoploss is not None and float(stoploss) > 0:
+                # Assume worst case — hit stoploss (no exit signal = likely bad outcome)
+                exit_price = float(stoploss)
                 source = "stoploss"
+                self._exit_from_stoploss += 1
             else:
-                # Try first target as a better estimate than entry price
-                targets_raw = pos.get("targets")
-                target_price = None
-                if targets_raw:
-                    try:
-                        targets = json.loads(targets_raw) if isinstance(targets_raw, str) else targets_raw
-                        if targets and len(targets) > 0:
-                            target_price = float(targets[0])
-                    except (json.JSONDecodeError, TypeError, IndexError):
-                        pass
-
-                if target_price is not None:
-                    exit_price = target_price
-                    source = "first target"
-                    self._exit_from_target += 1
-                else:
-                    exit_price = entry
-                    self._exit_from_entry_fallback += 1
+                # No stoploss available — break-even at entry
+                exit_price = entry
+                self._exit_from_entry_fallback += 1
 
             pnl = (exit_price - entry) * pos["quantity"]
             await self._db.close_position(pos["id"], pnl=pnl)
