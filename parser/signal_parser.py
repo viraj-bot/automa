@@ -133,7 +133,7 @@ _RUPEE_PRICE_RE = re.compile(
 
 # Strategy 1: Labelled targets like "target 1: 185", "T1: 185", "tgt1 - 185"
 _TARGET_LABELLED_RE = re.compile(
-    r"(?:target|tgt|tp|t)\s*(\d{1,2})\s*[:=\-–—]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    r"\b(?:target|tgt|tp)\s*(\d{1,2})\s*[:=\-–—]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
@@ -171,9 +171,13 @@ _STOPLOSS_EMOJI_RE = re.compile(
 
 
 def _clean_text(text: str) -> str:
-    """Remove emojis, collapse whitespace, strip."""
+    """Remove emojis, markdown formatting, URLs, collapse whitespace, strip."""
     text = _EMOJI_RE.sub(" ", text)
-    text = re.sub(r"[^\S\n]+", " ", text)  # collapse horizontal whitespace
+    text = text.replace("**", "")           # strip Telegram markdown bold
+    text = text.replace("__", "")           # strip Telegram markdown italic
+    text = text.replace("``", "")           # strip Telegram markdown code
+    text = re.sub(r"https?://\S+", " ", text)  # strip URLs to avoid false matches
+    text = re.sub(r"[^\S\n]+", " ", text)   # collapse horizontal whitespace
     return text.strip()
 
 
