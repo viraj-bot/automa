@@ -14,10 +14,30 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
+from pathlib import Path
 
 from rich.logging import RichHandler
+
+
+def _setup_ssl_ca_bundle() -> None:
+    """Auto-detect and configure a custom CA bundle for corporate proxies.
+
+    If ``data/ca-bundle.pem`` exists (created by the user to include their
+    corporate root CA alongside the standard certifi bundle), set the
+    ``REQUESTS_CA_BUNDLE`` and ``SSL_CERT_FILE`` env vars so that the
+    ``requests`` / ``urllib3`` / ``aiohttp`` libraries trust it.
+    """
+    custom_bundle = Path("data/ca-bundle.pem")
+    if custom_bundle.exists() and custom_bundle.stat().st_size > 0:
+        bundle_path = str(custom_bundle.resolve())
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", bundle_path)
+        os.environ.setdefault("SSL_CERT_FILE", bundle_path)
+
+
+_setup_ssl_ca_bundle()
 
 
 def _setup_logging(level: str) -> None:

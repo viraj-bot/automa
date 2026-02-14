@@ -146,14 +146,20 @@ class BacktestEngine:
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _init_groww(self) -> None:
-        """Lazily create a GrowwAPI instance for historical data."""
+        """Exchange API key + secret for an access token, then create client."""
         try:
             from growwapi import GrowwAPI
-            self._groww = GrowwAPI(self._settings.groww_api_token)
+
+            access_token = GrowwAPI.get_access_token(
+                api_key=self._settings.groww_api_token,
+                secret=self._settings.groww_api_secret,
+            )
+            self._groww = GrowwAPI(access_token)
             logger.info("Groww API initialised for backtest historical data")
         except Exception:
             logger.warning(
-                "Could not initialise Groww API — backtest will use signal prices"
+                "Could not initialise Groww API — backtest will use signal prices",
+                exc_info=True,
             )
             self._groww = None
 

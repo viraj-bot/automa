@@ -39,7 +39,11 @@ class Settings(BaseSettings):
     )
 
     # ── Groww ──
-    groww_api_token: str = Field(..., description="Groww Trade API auth token")
+    groww_api_token: str = Field(..., description="Groww Trade API key (JWT)")
+    groww_api_secret: str = Field(
+        ...,
+        description="Groww Trade API secret (used to generate access token)",
+    )
 
     # ── App mode ──
     mode: AppMode = Field(default=AppMode.PAPER, description="Application mode")

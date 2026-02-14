@@ -78,10 +78,26 @@ _RUPEE_PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_TARGET_RE = re.compile(
-    r"(?:target|tgt|tp)\s*\d*\s*[:=\-]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+# Matches individual "target N: <price>" patterns where N is a 1-2 digit number.
+# The target *number* (1, 2, 3 …) is consumed by the non-capturing \d{1,2} so
+# that the capturing group always gets the *price*.
+_TARGET_LABELLED_RE = re.compile(
+    r"(?:target|tgt|tp)\s*(\d{1,2})\s*[:=\-]\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+
+# Matches "targets: ₹60 / ₹90 / ₹120" or "tgt: 60, 90, 120" or
+# "target: ₹185 / ₹235" style — a keyword (without a trailing digit)
+# followed by a separator and a list of prices.
+_TARGET_LIST_RE = re.compile(
+    r"(?:targets?|tgt|tp)\s*[:=\-]\s*"
+    r"((?:(?:₹|rs\.?|inr)?\s*\d+(?:\.\d+)?\s*[/,]\s*)*"
+    r"(?:₹|rs\.?|inr)?\s*\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Extracts individual numeric values from a matched target-list string.
+_PRICE_IN_LIST_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
 _STOPLOSS_RE = re.compile(
     r"(?:stoploss|stop\s*loss|sl)\s*[:=\-]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
@@ -109,8 +125,27 @@ def _extract_price_after(text: str, keyword: str) -> Optional[float]:
 
 
 def _extract_targets(text: str) -> list[float]:
-    """Extract all target prices from the text."""
-    return [float(m.group(1)) for m in _TARGET_RE.finditer(text)]
+    """Extract all target prices from the text.
+
+    Handles two common formats:
+      1. Labelled:  "target 1: 185  target 2: 235"
+      2. List:      "targets: ₹60 / ₹90 / ₹120"  or  "tgt: 60, 90, 120"
+    """
+    # Strategy 1: labelled targets  (target 1: 185, target 2: 235, …)
+    # group(1) = target number, group(2) = price
+    labelled = [float(m.group(2)) for m in _TARGET_LABELLED_RE.finditer(text)]
+    if labelled:
+        return labelled
+
+    # Strategy 2: single keyword followed by a comma/slash-separated price list
+    list_match = _TARGET_LIST_RE.search(text)
+    if list_match:
+        raw_list = list_match.group(1)
+        prices = [float(p.group(1)) for p in _PRICE_IN_LIST_RE.finditer(raw_list)]
+        if prices:
+            return prices
+
+    return []
 
 
 def _extract_stoploss(text: str) -> Optional[float]:

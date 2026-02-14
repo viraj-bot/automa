@@ -43,8 +43,25 @@ class GrowwBroker(BrokerInterface):
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Create the GrowwAPI client and load the instruments CSV."""
-        self._groww = GrowwAPI(self._settings.groww_api_token)
+        """Exchange API key + secret for an access token, then load instruments."""
+        logger.info("Groww API: exchanging API key + secret for access token …")
+        loop = asyncio.get_running_loop()
+        try:
+            access_token = await loop.run_in_executor(
+                None,
+                lambda: GrowwAPI.get_access_token(
+                    api_key=self._settings.groww_api_token,
+                    secret=self._settings.groww_api_secret,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to obtain Groww access token. "
+                "Check GROWW_API_TOKEN and GROWW_API_SECRET in .env"
+            )
+            raise
+
+        self._groww = GrowwAPI(access_token)
         logger.info("Groww API client initialised — loading instruments …")
 
         # Load instruments in a thread so we don't block the event loop
