@@ -93,23 +93,42 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     console.print(stats)
     console.print()
 
-    # ── Exit price source breakdown ───────────────────────────────────
+    # ── Price source breakdown ────────────────────────────────────────
+    entry_groww = summary.get("entry_from_groww", 0)
+    entry_signal = summary.get("entry_from_signal", 0)
     exit_groww = summary.get("exit_from_groww", 0)
     exit_target = summary.get("exit_from_target", 0)
     exit_stoploss = summary.get("exit_from_stoploss", 0)
     exit_fallback = summary.get("exit_from_entry_fallback", 0)
     unmatched = summary.get("unmatched_close_signals", 0)
 
-    if exit_groww or exit_target or exit_stoploss or exit_fallback or unmatched:
+    has_diag = any([
+        entry_groww, entry_signal, exit_groww, exit_target,
+        exit_stoploss, exit_fallback, unmatched,
+    ])
+    if has_diag:
         diag = Table(
-            title="Diagnostics", show_header=False, box=None, padding=(0, 2)
+            title="Price Sources", show_header=False, box=None, padding=(0, 2)
         )
         diag.add_column("Metric", style="bold")
         diag.add_column("Value", justify="right")
 
+        # Entry sources
+        if entry_groww or entry_signal:
+            diag.add_row(
+                "Entries at Groww market price",
+                f"[green]{entry_groww}[/green]",
+            )
+            diag.add_row(
+                "Entries at signal price (no market data)",
+                f"[yellow]{entry_signal}[/yellow]",
+            )
+
+        # Exit sources
         if exit_groww:
             diag.add_row(
-                "Exits from Groww historical data", f"[green]{exit_groww}[/green]"
+                "Exits at Groww market price",
+                f"[green]{exit_groww}[/green]",
             )
         if exit_target:
             diag.add_row(

@@ -61,8 +61,10 @@ class BacktestEngine:
         self._groww: Any = None
         self._instruments_df: Optional[pd.DataFrame] = None
 
-        # Counters for exit-price source tracking
-        self._exit_from_groww = 0
+        # Counters for price source tracking
+        self._entry_from_groww = 0       # entries filled at Groww market price
+        self._entry_from_signal = 0      # entries filled at signal price (no data)
+        self._exit_from_groww = 0        # exits at Groww market price
         self._exit_from_target = 0       # book-profit exits using target price
         self._exit_from_stoploss = 0     # exits/orphans using stoploss price
         self._exit_from_entry_fallback = 0  # last-resort break-even at entry
@@ -186,7 +188,9 @@ class BacktestEngine:
         summary["orphaned_positions"] = len(open_positions)
         summary["unparsed_messages"] = unparsed_count
 
-        # Exit-price source breakdown
+        # Price source breakdown
+        summary["entry_from_groww"] = self._entry_from_groww
+        summary["entry_from_signal"] = self._entry_from_signal
         summary["exit_from_groww"] = self._exit_from_groww
         summary["exit_from_target"] = self._exit_from_target
         summary["exit_from_stoploss"] = self._exit_from_stoploss
@@ -297,6 +301,23 @@ class BacktestEngine:
         logger.debug("[BT] Lot size not found for %s, defaulting to 1", groww_symbol)
         return 1
 
+    def _build_groww_symbol(
+        self,
+        underlying: str,
+        expiry_day: int,
+        expiry_month: str,
+        strike_price: float,
+        option_type: str,
+        at_time: datetime,
+    ) -> str:
+        """Build the Groww symbol string for an F&O instrument."""
+        month_title = _MONTH_TITLE.get(expiry_month.upper(), expiry_month.title())
+        year_short = at_time.year % 100
+        return (
+            f"NSE-{underlying}-{expiry_day:02d}{month_title}{year_short}"
+            f"-{int(strike_price)}-{option_type}"
+        )
+
     def _get_historical_price(
         self,
         underlying: str,
@@ -306,48 +327,138 @@ class BacktestEngine:
         option_type: str,
         at_time: datetime,
     ) -> Optional[float]:
-        """Fetch the close price of a 1-min candle nearest to *at_time*."""
+        """Fetch the close price of a candle nearest to *at_time*.
+
+        Tries progressively wider time windows:
+        1.  ±5 minutes around the signal time  (1-min candles)
+        2.  ±30 minutes                        (1-min candles)
+        3.  Full trading day 09:15–15:30        (5-min candles)
+        """
         if self._groww is None:
             return None
 
-        month_title = _MONTH_TITLE.get(expiry_month.upper(), expiry_month.title())
-        year_short = at_time.year % 100
-
-        groww_symbol = (
-            f"NSE-{underlying}-{expiry_day:02d}{month_title}{year_short}"
-            f"-{int(strike_price)}-{option_type}"
+        groww_symbol = self._build_groww_symbol(
+            underlying, expiry_day, expiry_month,
+            strike_price, option_type, at_time,
         )
 
-        start = at_time.strftime("%Y-%m-%d %H:%M:%S")
-        end = (at_time + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        # ── Strategy 1: tight window ±5 min, 1-min candles ──
+        price = self._fetch_candle_price(
+            groww_symbol, at_time,
+            window_before=timedelta(minutes=5),
+            window_after=timedelta(minutes=5),
+            interval=self._groww.CANDLE_INTERVAL_MIN_1,
+        )
+        if price is not None:
+            return price
 
-        req_params = {
-            "groww_symbol": groww_symbol,
-            "start_time": start,
-            "end_time": end,
-            "interval": "1min",
-        }
-        logger.debug("[GROWW REQ] get_historical_candles: %s", req_params)
+        # ── Strategy 2: wider window ±30 min, 1-min candles ──
+        price = self._fetch_candle_price(
+            groww_symbol, at_time,
+            window_before=timedelta(minutes=30),
+            window_after=timedelta(minutes=30),
+            interval=self._groww.CANDLE_INTERVAL_MIN_1,
+        )
+        if price is not None:
+            return price
+
+        # ── Strategy 3: full trading day, 5-min candles ──
+        trading_day = at_time.replace(hour=9, minute=15, second=0, microsecond=0)
+        trading_end = at_time.replace(hour=15, minute=30, second=0, microsecond=0)
+        price = self._fetch_candle_price(
+            groww_symbol, at_time,
+            explicit_start=trading_day,
+            explicit_end=trading_end,
+            interval=self._groww.CANDLE_INTERVAL_MIN_5,
+        )
+        if price is not None:
+            return price
+
+        logger.warning(
+            "[GROWW] No candle data for %s at %s (tried 3 strategies)",
+            groww_symbol, at_time.strftime("%Y-%m-%d %H:%M"),
+        )
+        return None
+
+    def _fetch_candle_price(
+        self,
+        groww_symbol: str,
+        target_time: datetime,
+        *,
+        window_before: Optional[timedelta] = None,
+        window_after: Optional[timedelta] = None,
+        explicit_start: Optional[datetime] = None,
+        explicit_end: Optional[datetime] = None,
+        interval: str = "1minute",
+    ) -> Optional[float]:
+        """Low-level helper: fetch candles and return the close price of the
+        candle nearest to *target_time*.
+        """
+        if explicit_start and explicit_end:
+            start_dt = explicit_start
+            end_dt = explicit_end
+        else:
+            start_dt = target_time - (window_before or timedelta(minutes=5))
+            end_dt = target_time + (window_after or timedelta(minutes=5))
+
+        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        logger.debug(
+            "[GROWW REQ] candles %s  %s → %s  interval=%s",
+            groww_symbol, start_str, end_str, interval,
+        )
 
         try:
             data = self._groww.get_historical_candles(
                 exchange=self._groww.EXCHANGE_NSE,
                 segment=self._groww.SEGMENT_FNO,
                 groww_symbol=groww_symbol,
-                start_time=start,
-                end_time=end,
-                candle_interval=self._groww.CANDLE_INTERVAL_MIN_1,
+                start_time=start_str,
+                end_time=end_str,
+                candle_interval=interval,
             )
             candles = data.get("candles", [])
             logger.debug(
-                "[GROWW RES] get_historical_candles %s: %d candles, data=%s",
-                groww_symbol, len(candles), data,
+                "[GROWW RES] %s: %d candles returned", groww_symbol, len(candles),
             )
-            if candles:
-                return float(candles[0][4])  # close price
+
+            if not candles:
+                return None
+
+            # Find the candle closest to target_time
+            target_ts = target_time.timestamp()
+            best_candle = None
+            best_diff = float("inf")
+            for c in candles:
+                # candle[0] is the timestamp (could be epoch ms or string)
+                candle_ts = c[0]
+                if isinstance(candle_ts, str):
+                    try:
+                        candle_ts = datetime.strptime(
+                            candle_ts, "%Y-%m-%d %H:%M:%S"
+                        ).timestamp()
+                    except ValueError:
+                        candle_ts = float(candle_ts) / 1000  # epoch ms
+                elif candle_ts > 1e12:
+                    candle_ts = candle_ts / 1000  # epoch ms → seconds
+
+                diff = abs(candle_ts - target_ts)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_candle = c
+
+            if best_candle is not None:
+                price = float(best_candle[4])  # close price
+                logger.debug(
+                    "[GROWW] %s nearest candle close=₹%.2f (%.0fs from signal)",
+                    groww_symbol, price, best_diff,
+                )
+                return price
+
         except Exception as exc:
             logger.debug(
-                "[GROWW ERR] get_historical_candles %s: %s", groww_symbol, exc
+                "[GROWW ERR] candles %s: %s", groww_symbol, exc,
             )
 
         return None
@@ -377,7 +488,20 @@ class BacktestEngine:
             ),
         )
 
-        fill_price = hist_price if hist_price is not None else signal.entry_price
+        if hist_price is not None:
+            fill_price = hist_price
+            self._entry_from_groww += 1
+            logger.info(
+                "[BT] ENTRY %s: using Groww market price ₹%.2f (signal: ₹%.2f)",
+                signal.display_name, fill_price, signal.entry_price,
+            )
+        else:
+            fill_price = signal.entry_price
+            self._entry_from_signal += 1
+            logger.info(
+                "[BT] ENTRY %s: using signal price ₹%.2f (no Groww data)",
+                signal.display_name, fill_price,
+            )
 
         # Look up the real lot size from the instruments CSV
         lot_size = self._resolve_lot_size(
