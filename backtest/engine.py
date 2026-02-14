@@ -31,6 +31,82 @@ _MONTH_TITLE = {
     "SEP": "Sep", "OCT": "Oct", "NOV": "Nov", "DEC": "Dec",
 }
 
+# Well-known F&O lot sizes (as of 2025-2026).
+# Used as fallback when the instruments CSV lookup fails.
+_KNOWN_LOT_SIZES: dict[str, int] = {
+    "NIFTY": 25,
+    "NIFTY50": 25,
+    "BANKNIFTY": 15,
+    "FINNIFTY": 25,
+    "MIDCPNIFTY": 50,
+    "SENSEX": 10,
+    "BANKEX": 15,
+    # Stocks — add common ones that appear in the group
+    "TATAPOWER": 1125,
+    "RELIANCE": 250,
+    "TCS": 175,
+    "INFY": 300,
+    "HDFCBANK": 550,
+    "ICICIBANK": 700,
+    "SBIN": 750,
+    "TATAMOTORS": 575,
+    "TATASTEEL": 550,
+    "ITC": 1600,
+    "BAJFINANCE": 125,
+    "AXISBANK": 625,
+    "MARUTI": 50,
+    "LT": 150,
+    "SUNPHARMA": 700,
+    "WIPRO": 1500,
+    "TECHM": 300,
+    "HCLTECH": 350,
+    "ADANIENT": 250,
+    "ADANIPORTS": 1250,
+    "BHARTIARTL": 475,
+    "COALINDIA": 2100,
+    "HINDALCO": 1075,
+    "HINDUNILVR": 300,
+    "JSWSTEEL": 675,
+    "KOTAKBANK": 400,
+    "NTPC": 1500,
+    "ONGC": 3075,
+    "POWERGRID": 1900,
+    "ULTRACEMCO": 50,
+    "TITAN": 375,
+    "NESTLEIND": 50,
+    "DIVISLAB": 100,
+    "DRREDDY": 125,
+    "CIPLA": 650,
+    "APOLLOHOSP": 125,
+    "EICHERMOT": 175,
+    "HEROMOTOCO": 150,
+    "BAJAJ-AUTO": 125,
+    "INDUSINDBK": 450,
+    "TRENT": 100,
+    "VOLTAS": 375,
+    "AMBER": 100,
+    "ASTRAL": 425,
+    "VBL": 1125,
+    "SHRIRAMFIN": 825,
+    "HINDZINC": 1225,
+    "JINDALSTEL": 625,
+    "UPL": 1355,
+    "ADANIGREEN": 600,
+    "JUBLFOOD": 1250,
+    "JIOFIN": 2350,
+    "APLAPOLLO": 350,
+    "LTF": 2250,
+    "PNBHOUSING": 650,
+    "TVSMOTOR": 175,
+    "SONACOMS": 1225,
+    "GODREJPROP": 275,
+    "BEL": 1425,
+    "INDHOTEL": 1000,
+    "NYKAA": 3125,
+    "COFORGE": 200,
+    "PERSISTENT": 150,
+}
+
 
 class BacktestEngine:
     """Replay historical Telegram signals against Groww historical data.
@@ -325,7 +401,16 @@ class BacktestEngine:
                 )
                 return max(lot, 1)
 
-        logger.debug("[BT] Lot size not found for %s, defaulting to 1", groww_symbol)
+        # Fallback: well-known lot sizes
+        if underlying.upper() in _KNOWN_LOT_SIZES:
+            lot = _KNOWN_LOT_SIZES[underlying.upper()]
+            logger.debug(
+                "[BT] Lot size for %s: %d (from known lot sizes table)",
+                groww_symbol, lot,
+            )
+            return lot
+
+        logger.warning("[BT] Lot size not found for %s, defaulting to 1", groww_symbol)
         return 1
 
     def _build_groww_symbol(
@@ -599,8 +684,15 @@ class BacktestEngine:
     ) -> None:
         position = await self._find_matching_position(signal)
         if position is None:
+            # Position was already closed (likely by an earlier EXIT signal).
+            # If this book-profit has an explicit exit price, try to update
+            # the recently closed position's P&L with the better price.
+            if signal.exit_price is not None:
+                updated = await self._update_closed_position_pnl(signal)
+                if updated:
+                    return
             logger.warning(
-                "[BT] No open position for BOOK_PROFIT %s (exit_price=₹%s) — P&L LOST",
+                "[BT] No open position for BOOK_PROFIT %s (exit_price=₹%s)",
                 signal.display_name, signal.exit_price,
             )
             self._unmatched_close_signals += 1
@@ -641,6 +733,51 @@ class BacktestEngine:
             "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
             position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
         )
+
+    async def _update_closed_position_pnl(
+        self, signal: BookProfitSignal
+    ) -> bool:
+        """When a book-profit signal arrives but the position is already closed
+        (by an earlier EXIT), update the trade log with the real exit price.
+
+        Returns True if a matching closed position was found and updated.
+        """
+        sig_otype = signal.option_type.value if signal.option_type else None
+        closed_pos = await self._db.find_recently_closed_position(
+            underlying=signal.underlying,
+            strike_price=signal.strike_price,
+            option_type=sig_otype,
+        )
+        if closed_pos is None:
+            return False
+
+        entry_price = float(closed_pos["avg_entry_price"])
+        quantity = int(closed_pos["quantity"])
+        new_exit = float(signal.exit_price)
+        new_pnl = (new_exit - entry_price) * quantity
+
+        # Update the DB
+        await self._db.update_position_pnl(closed_pos["id"], new_pnl)
+
+        # Update the trade log entry for this position
+        for trade in self._trade_log:
+            if (trade["instrument"] == closed_pos["trading_symbol"]
+                    and trade["entry_price"] == entry_price):
+                old_pnl = trade["pnl"]
+                trade["exit_price"] = new_exit
+                trade["exit_source"] = "signal"
+                trade["close_type"] = "BOOK_PROFIT"
+                trade["pnl"] = new_pnl
+                logger.info(
+                    "[BT] UPDATED %s: exit ₹%.2f→₹%.2f (%s→signal) P&L ₹%.2f→₹%.2f",
+                    closed_pos["trading_symbol"],
+                    trade.get("exit_price", 0), new_exit,
+                    trade.get("exit_source", "?"),
+                    old_pnl, new_pnl,
+                )
+                return True
+
+        return False
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -777,19 +914,30 @@ class BacktestEngine:
         stoploss_val = float(stoploss) if stoploss is not None and float(stoploss) > 0 else None
 
         # ── 3. Fallback depends on close_reason ──
-        if close_reason in ("BOOK_PROFIT", "EXIT"):
+        if close_reason == "BOOK_PROFIT":
+            # Admin explicitly said "book profit" → trade was profitable.
+            # Use target as best estimate.
             if first_target is not None:
                 logger.info(
-                    "[BT] Exit %s (%s): target ₹%.2f (no Groww data)",
-                    ts, close_reason, first_target,
+                    "[BT] Exit %s (BOOK_PROFIT): target ₹%.2f (no Groww data)",
+                    ts, first_target,
                 )
                 return first_target, "target"
+
+        elif close_reason == "EXIT":
+            # Admin said "exit" without saying "book profit".
+            # In this group, profitable exits get a BOOK_PROFIT signal.
+            # A plain EXIT likely means the trade didn't work out → use stoploss.
+            # (If a BOOK_PROFIT arrives later, _update_closed_position_pnl
+            #  will correct the P&L with the real exit price.)
             if stoploss_val is not None:
                 logger.info(
-                    "[BT] Exit %s (%s): stoploss ₹%.2f (no target)",
-                    ts, close_reason, stoploss_val,
+                    "[BT] Exit %s (EXIT): stoploss ₹%.2f (no Groww data, "
+                    "assuming loss — will be corrected if book-profit follows)",
+                    ts, stoploss_val,
                 )
                 return stoploss_val, "stoploss"
+
         else:
             # ORPHAN — assume worst case
             if stoploss_val is not None:

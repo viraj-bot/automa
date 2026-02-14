@@ -286,6 +286,41 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def find_recently_closed_position(
+        self,
+        underlying: str,
+        strike_price: Optional[float] = None,
+        option_type: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Find a recently closed position matching the given criteria.
+
+        Used when a book-profit signal arrives after an EXIT already closed
+        the position — we can update the P&L with the better price.
+        """
+        query = "SELECT * FROM positions WHERE status = 'CLOSED' AND underlying = ?"
+        params: list[Any] = [underlying]
+
+        if strike_price is not None:
+            query += " AND strike_price = ?"
+            params.append(strike_price)
+        if option_type is not None:
+            query += " AND option_type = ?"
+            params.append(option_type)
+
+        query += " ORDER BY closed_at DESC LIMIT 1"
+
+        cursor = await self.conn.execute(query, params)
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_position_pnl(self, position_id: int, pnl: float) -> None:
+        """Update the P&L of an already-closed position."""
+        await self.conn.execute(
+            "UPDATE positions SET pnl = ? WHERE id = ?",
+            (pnl, position_id),
+        )
+        await self.conn.commit()
+
     async def get_all_positions(self, status: Optional[str] = None) -> list[dict[str, Any]]:
         if status:
             cursor = await self.conn.execute(
