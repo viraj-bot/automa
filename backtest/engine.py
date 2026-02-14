@@ -66,6 +66,9 @@ class BacktestEngine:
         # ── Trade log: every closed trade is recorded here ──
         self._trade_log: list[dict[str, Any]] = []
 
+        # Map position trading_symbol → entry message time (for the trade log)
+        self._entry_times: dict[str, str] = {}
+
         # Counters
         self._unmatched_close_signals = 0
         self._unmatched_exit_signals = 0
@@ -547,6 +550,10 @@ class BacktestEngine:
             is_paper=True,
         )
 
+        # Remember the entry message time for the trade log
+        entry_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
+        self._entry_times[ts] = entry_time_str
+
         logger.info(
             "[BT] ENTRY %s x%d @ ₹%.2f (%s) | signal=₹%.2f SL=%s T=%s",
             signal.display_name, quantity, fill_price, entry_source,
@@ -571,19 +578,20 @@ class BacktestEngine:
         pnl = (exit_price - entry_price) * quantity
         await self._db.close_position(position["id"], pnl=pnl)
 
+        exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
         self._trade_log.append({
             "trade_no": len(self._trade_log) + 1,
             "instrument": position["trading_symbol"],
             "underlying": position["underlying"],
             "qty": quantity,
             "entry_price": entry_price,
-            "entry_source": "signal",  # stored at entry time
+            "entry_source": "signal",
             "exit_price": exit_price,
             "exit_source": exit_source,
             "close_type": "EXIT",
             "pnl": pnl,
-            "entry_time": position.get("opened_at", ""),
-            "exit_time": msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time),
+            "entry_time": self._entry_times.get(position["trading_symbol"], ""),
+            "exit_time": exit_time_str,
         })
 
         logger.info(
@@ -626,6 +634,7 @@ class BacktestEngine:
         pnl = (exit_price - entry_price) * quantity
         await self._db.close_position(position["id"], pnl=pnl)
 
+        exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
         self._trade_log.append({
             "trade_no": len(self._trade_log) + 1,
             "instrument": position["trading_symbol"],
@@ -637,8 +646,8 @@ class BacktestEngine:
             "exit_source": exit_source,
             "close_type": "BOOK_PROFIT",
             "pnl": pnl,
-            "entry_time": position.get("opened_at", ""),
-            "exit_time": msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time),
+            "entry_time": self._entry_times.get(position["trading_symbol"], ""),
+            "exit_time": exit_time_str,
         })
 
         logger.info(
@@ -902,7 +911,7 @@ class BacktestEngine:
                 "exit_source": exit_source,
                 "close_type": "ORPHAN",
                 "pnl": pnl,
-                "entry_time": pos.get("opened_at", ""),
+                "entry_time": self._entry_times.get(pos["trading_symbol"], ""),
                 "exit_time": "force-closed",
             })
 

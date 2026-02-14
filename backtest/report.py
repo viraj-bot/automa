@@ -66,12 +66,14 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
 
     trade_table = Table(title="Trade Log", show_lines=True)
     trade_table.add_column("#", justify="right", style="dim", width=3)
-    trade_table.add_column("Instrument", style="bold", min_width=20)
+    trade_table.add_column("Instrument", style="bold", min_width=18)
     trade_table.add_column("Qty", justify="right", width=5)
-    trade_table.add_column("Entry ₹", justify="right", width=10)
-    trade_table.add_column("Exit ₹", justify="right", width=10)
-    trade_table.add_column("Exit Source", width=12)
-    trade_table.add_column("Close Type", width=12)
+    trade_table.add_column("Entry Date", width=12)
+    trade_table.add_column("Entry ₹", justify="right", width=9)
+    trade_table.add_column("Exit Date", width=12)
+    trade_table.add_column("Exit ₹", justify="right", width=9)
+    trade_table.add_column("Exit Src", width=9)
+    trade_table.add_column("Type", width=7)
     trade_table.add_column("P&L ₹", justify="right", width=12)
 
     for t in trade_log:
@@ -86,14 +88,26 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
             "entry": "dim",
         }.get(exit_src, "white")
 
+        # Shorten close type for display
+        close_short = {
+            "BOOK_PROFIT": "BP",
+            "EXIT": "EXIT",
+            "ORPHAN": "ORPHAN",
+        }.get(t["close_type"], t["close_type"])
+
+        entry_time = t.get("entry_time", "")
+        exit_time = t.get("exit_time", "")
+
         trade_table.add_row(
             str(t["trade_no"]),
             t["instrument"],
             str(t["qty"]),
+            f"[dim]{entry_time}[/dim]",
             f"{t['entry_price']:,.2f}",
+            f"[dim]{exit_time}[/dim]",
             f"{t['exit_price']:,.2f}",
             f"[{src_colour}]{exit_src}[/{src_colour}]",
-            t["close_type"],
+            close_short,
             f"[{pnl_colour}]{pnl:,.2f}[/{pnl_colour}]",
         )
 
