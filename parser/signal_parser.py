@@ -129,30 +129,44 @@ _RUPEE_PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches individual "target N: <price>" patterns where N is a 1-2 digit number.
-# The target *number* (1, 2, 3 …) is consumed by the non-capturing \d{1,2} so
-# that the capturing group always gets the *price*.
+# ── Target extraction regexes (multiple strategies) ──
+
+# Strategy 1: Labelled targets like "target 1: 185", "T1: 185", "tgt1 - 185"
 _TARGET_LABELLED_RE = re.compile(
-    r"(?:target|tgt|tp)\s*(\d{1,2})\s*[:=\-]\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    r"(?:target|tgt|tp|t)\s*(\d{1,2})\s*[:=\-–—]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# Matches "targets: ₹60 / ₹90 / ₹120" or "tgt: 60, 90, 120" or
-# "target: ₹185 / ₹235" style — a keyword (without a trailing digit)
-# followed by a separator and a list of prices.
+# Strategy 2: List format like "targets: ₹60 / ₹90 / ₹120" or "tgt: 60, 90, 120"
 _TARGET_LIST_RE = re.compile(
-    r"(?:targets?|tgt|tp)\s*[:=\-]\s*"
-    r"((?:(?:₹|rs\.?|inr)?\s*\d+(?:\.\d+)?\s*[/,]\s*)*"
+    r"(?:targets?|tgt|tp)\s*[:=\-–—]\s*"
+    r"((?:(?:₹|rs\.?|inr)?\s*\d+(?:\.\d+)?\s*[/,\s]\s*)*"
     r"(?:₹|rs\.?|inr)?\s*\d+(?:\.\d+)?)",
     re.IGNORECASE,
+)
+
+# Strategy 3: "target 185" or "tgt 185" (keyword followed directly by price, no number)
+_TARGET_BARE_RE = re.compile(
+    r"(?:target|tgt)\s+(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Strategy 4: Emoji-based targets like "🎯 185" or "🎯185/235"
+_TARGET_EMOJI_RE = re.compile(
+    r"🎯\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
 )
 
 # Extracts individual numeric values from a matched target-list string.
 _PRICE_IN_LIST_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
 _STOPLOSS_RE = re.compile(
-    r"(?:stoploss|stop\s*loss|sl)\s*(?:at|@|[:=\-])?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    r"(?:stoploss|stop\s*loss|sl|stop)\s*(?:at|@|[:=\-–—])?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
+)
+
+# Emoji-based stoploss: "🛑 90" or "❌ 90"
+_STOPLOSS_EMOJI_RE = re.compile(
+    r"[🛑❌⛔]\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
 )
 
 
@@ -190,11 +204,13 @@ _RANGE_PRICE_RE = re.compile(
 def _extract_targets(text: str) -> list[float]:
     """Extract all target prices from the text.
 
-    Handles two common formats:
-      1. Labelled:  "target 1: 185  target 2: 235"
-      2. List:      "targets: ₹60 / ₹90 / ₹120"  or  "tgt: 60, 90, 120"
+    Tries multiple strategies in order of specificity:
+      1. Labelled:  "target 1: 185", "T1: 185", "tgt1 - 185"
+      2. List:      "targets: ₹60 / ₹90 / ₹120" or "tgt: 60, 90, 120"
+      3. Bare:      "target 185" (keyword + price, no number)
+      4. Emoji:     "🎯 185"
     """
-    # Strategy 1: labelled targets  (target 1: 185, target 2: 235, …)
+    # Strategy 1: labelled targets  (target 1: 185, T1: 185, …)
     # group(1) = target number, group(2) = price
     labelled = [float(m.group(2)) for m in _TARGET_LABELLED_RE.finditer(text)]
     if labelled:
@@ -208,12 +224,28 @@ def _extract_targets(text: str) -> list[float]:
         if prices:
             return prices
 
+    # Strategy 3: bare "target 185" without a number
+    bare = [float(m.group(1)) for m in _TARGET_BARE_RE.finditer(text)]
+    if bare:
+        return bare
+
+    # Strategy 4: emoji-based "🎯 185"
+    emoji_targets = [float(m.group(1)) for m in _TARGET_EMOJI_RE.finditer(text)]
+    if emoji_targets:
+        return emoji_targets
+
     return []
 
 
 def _extract_stoploss(text: str) -> Optional[float]:
     m = _STOPLOSS_RE.search(text)
-    return float(m.group(1)) if m else None
+    if m:
+        return float(m.group(1))
+    # Try emoji-based stoploss
+    m = _STOPLOSS_EMOJI_RE.search(text)
+    if m:
+        return float(m.group(1))
+    return None
 
 
 def _normalise_month(raw: str) -> str:
@@ -322,8 +354,10 @@ class SignalParser:
             logger.debug("ENTRY signal but no price found: %s", cleaned[:80])
             return None
 
-        targets = _extract_targets(cleaned)
-        stoploss = _extract_stoploss(cleaned)
+        # Try extracting targets/SL from cleaned text first, then raw text
+        # (raw text preserves emojis that _clean_text strips)
+        targets = _extract_targets(cleaned) or _extract_targets(raw)
+        stoploss = _extract_stoploss(cleaned) or _extract_stoploss(raw)
 
         return EntrySignal(
             underlying=underlying,

@@ -132,12 +132,13 @@ class BacktestEngine:
                         entries_with_targets += 1
                     else:
                         entries_without_targets += 1
-                        logger.info(
-                            "[BT] ENTRY without targets: %s (price=₹%.2f, SL=%s) | %s",
-                            signal.display_name, signal.entry_price,
-                            signal.stoploss,
-                            signal.raw_text.replace("\n", " ")[:120],
-                        )
+                    # Always log entry details for debugging
+                    logger.info(
+                        "[BT] ENTRY %s | price=₹%.2f | SL=%s | targets=%s | raw: %s",
+                        signal.display_name, signal.entry_price,
+                        signal.stoploss, signal.targets,
+                        repr(signal.raw_text[:200]),
+                    )
                 elif isinstance(signal, ExitSignal):
                     exit_count += 1
                 elif isinstance(signal, BookProfitSignal):
