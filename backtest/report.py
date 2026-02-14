@@ -57,6 +57,7 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
 
     wins = summary.get("wins", 0) or 0
     losses = summary.get("losses", 0) or 0
+    breakeven = summary.get("breakeven", 0) or 0
     win_rate = (wins / total * 100) if total else 0
 
     stats = Table(title="Trade Statistics", show_header=False, box=None, padding=(0, 2))
@@ -66,6 +67,8 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     stats.add_row("Total closed trades", str(total))
     stats.add_row("Winning trades", f"[green]{wins}[/green]")
     stats.add_row("Losing trades", f"[red]{losses}[/red]")
+    if breakeven > 0:
+        stats.add_row("Break-even trades (P&L = 0)", f"[dim]{breakeven}[/dim]")
     stats.add_row("Win rate", f"{win_rate:.1f}%")
 
     if wins > 0 and losses > 0:
@@ -78,6 +81,42 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
 
     console.print(stats)
     console.print()
+
+    # ── Exit price source breakdown ───────────────────────────────────
+    exit_groww = summary.get("exit_from_groww", 0)
+    exit_target = summary.get("exit_from_target", 0)
+    exit_fallback = summary.get("exit_from_entry_fallback", 0)
+    unmatched = summary.get("unmatched_close_signals", 0)
+
+    if exit_groww or exit_target or exit_fallback or unmatched:
+        diag = Table(
+            title="Diagnostics", show_header=False, box=None, padding=(0, 2)
+        )
+        diag.add_column("Metric", style="bold")
+        diag.add_column("Value", justify="right")
+
+        if exit_groww:
+            diag.add_row(
+                "Exits from Groww historical data", f"[green]{exit_groww}[/green]"
+            )
+        if exit_target:
+            diag.add_row(
+                "Exits from target price (no market data)",
+                f"[yellow]{exit_target}[/yellow]",
+            )
+        if exit_fallback:
+            diag.add_row(
+                "Exits at entry price (fallback, no data)",
+                f"[red]{exit_fallback}[/red]",
+            )
+        if unmatched:
+            diag.add_row(
+                "Unmatched close signals (no open position)",
+                f"[dim]{unmatched}[/dim]",
+            )
+
+        console.print(diag)
+        console.print()
 
     # ── P&L table ────────────────────────────────────────────────────────
     pnl_table = Table(title="Profit & Loss", show_header=False, box=None, padding=(0, 2))

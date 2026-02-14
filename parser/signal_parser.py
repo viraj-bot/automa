@@ -60,11 +60,13 @@ _MONTH_PATTERN = "|".join(_MONTHS.keys())
 
 # ── Instrument pattern (shared across signal types) ──
 # Matches: NIFTY50 17 FEB 25600 PE  or  INDHOTEL 24 FEB 690 CE
+#          BANK NIFTY 17 FEB 25600 PE  (two-word underlyings)
 # Groups:  underlying, day, month, strike, option_type
-# The underlying group does NOT allow spaces — it captures a single token
-# like NIFTY50, BANKNIFTY, INDHOTEL, etc.
+# The underlying group allows an optional second word so that
+# "BANK NIFTY", "FIN NIFTY" etc. are captured as a single group
+# and later normalised via _normalize_underlying().
 _INSTRUMENT_RE = re.compile(
-    r"(?P<underlying>[A-Z][A-Z0-9]{1,20})\s+"
+    r"(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)\s+"
     r"(?P<day>\d{1,2})\s+"
     rf"(?P<month>{_MONTH_PATTERN})\s+"
     r"(?P<strike>\d+(?:\.\d+)?)\s*"
@@ -100,7 +102,7 @@ _TARGET_LIST_RE = re.compile(
 _PRICE_IN_LIST_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
 _STOPLOSS_RE = re.compile(
-    r"(?:stoploss|stop\s*loss|sl)\s*[:=\-]?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    r"(?:stoploss|stop\s*loss|sl)\s*(?:at|@|[:=\-])?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
@@ -122,6 +124,18 @@ def _extract_price_after(text: str, keyword: str) -> Optional[float]:
     if m:
         return float(m.group(1))
     return None
+
+
+# Additional price-keyword patterns for entry price extraction
+_CMP_PRICE_RE = re.compile(
+    r"(?:cmp|around|near|above|below)\s*(?:at|@|[:=\-])?\s*(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+_RANGE_PRICE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*(?:range|zone)?",
+    re.IGNORECASE,
+)
 
 
 def _extract_targets(text: str) -> list[float]:
@@ -160,17 +174,21 @@ def _normalise_month(raw: str) -> str:
 # ── Signal-type keyword detectors ──
 
 _ENTRY_KEYWORDS = re.compile(
-    r"\b(buy|new\s+option\s+trade|fresh\s+entry|enter|long|go\s+long|initiate)\b",
+    r"\b(buy|sell|short|new\s+option\s+trade|fresh\s+entry|enter|long|"
+    r"go\s+long|go\s+short|initiate|add\s+more|add\s+position)\b",
     re.IGNORECASE,
 )
 
 _EXIT_KEYWORDS = re.compile(
-    r"\b(exit|close|square\s*off|please\s+exit|exit\s+from|get\s+out)\b",
+    r"\b(exit|exited|close|closed|square\s*off|squared\s+off|"
+    r"please\s+exit|exit\s+from|get\s+out|out\s+of)\b",
     re.IGNORECASE,
 )
 
 _BOOK_PROFIT_KEYWORDS = re.compile(
-    r"\b(book\s+profit|partial\s+profit|trail\s+sl|book\s+partial|take\s+profit)\b",
+    r"\b(book\s+prof(?:it|t)|booked\s+prof(?:it|t)|profit\s+booked|"
+    r"partial\s+profit|partial\s+exit|trail\s+sl|trailing\s+sl|"
+    r"book\s+partial|take\s+profit)\b",
     re.IGNORECASE,
 )
 
@@ -240,6 +258,18 @@ class SignalParser:
             # Try "@ 135"
             entry_price = _extract_price_after(cleaned, "@")
         if entry_price is None:
+            # Try "CMP 135", "around 135", "near 135", etc.
+            cmp_m = _CMP_PRICE_RE.search(cleaned)
+            if cmp_m:
+                entry_price = float(cmp_m.group(1))
+        if entry_price is None:
+            # Try "135-140 range" — use midpoint
+            range_m = _RANGE_PRICE_RE.search(cleaned[m.end():])
+            if range_m:
+                lo = float(range_m.group(1))
+                hi = float(range_m.group(2))
+                entry_price = (lo + hi) / 2
+        if entry_price is None:
             logger.debug("ENTRY signal but no price found: %s", cleaned[:80])
             return None
 
@@ -284,9 +314,10 @@ class SignalParser:
                 timestamp=timestamp,
             )
 
-        # Partial match: "Exit NIFTY50 17 FEB" without strike/otype
+        # Partial match: "Exit NIFTY50 17 FEB" or "Exit BANK NIFTY 17 FEB"
         partial = re.search(
-            r"(?:exit|close|square\s*off)\s+(?:from\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20})"
+            r"(?:exit|close|square\s*off|exited|closed|squared\s+off|out\s+of)"
+            r"\s+(?:from\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)"
             r"(?:\s+(?P<day>\d{1,2})\s+(?P<month>" + _MONTH_PATTERN + r"))?",
             cleaned,
             re.IGNORECASE,
@@ -337,9 +368,10 @@ class SignalParser:
                 timestamp=timestamp,
             )
 
-        # Partial: "Book Profit in INDHOTEL 24 FEB" (without strike)
+        # Partial: "Book Profit in INDHOTEL 24 FEB" or "Booked profit BANK NIFTY"
         partial = re.search(
-            r"(?:book\s+profit|take\s+profit)\s+(?:in\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20})"
+            r"(?:book(?:ed)?\s+prof(?:it|t)|take\s+profit|profit\s+booked|partial\s+exit)"
+            r"\s+(?:in\s+|on\s+)?(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)"
             r"(?:\s+(?P<day>\d{1,2})\s+(?P<month>" + _MONTH_PATTERN + r"))?",
             cleaned,
             re.IGNORECASE,

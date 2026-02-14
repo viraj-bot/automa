@@ -61,6 +61,12 @@ class BacktestEngine:
         self._groww: Any = None
         self._instruments_df: Optional[pd.DataFrame] = None
 
+        # Counters for exit-price source tracking
+        self._exit_from_groww = 0
+        self._exit_from_target = 0
+        self._exit_from_entry_fallback = 0
+        self._unmatched_close_signals = 0
+
     # ── Public API ───────────────────────────────────────────────────────
 
     async def run(self, days: int = 30, limit: Optional[int] = None) -> dict[str, Any]:
@@ -142,6 +148,12 @@ class BacktestEngine:
         open_positions = await self._db.get_all_positions(status="OPEN")
         summary["orphaned_positions"] = len(open_positions)
         summary["unparsed_messages"] = unparsed_count
+
+        # Exit-price source breakdown
+        summary["exit_from_groww"] = self._exit_from_groww
+        summary["exit_from_target"] = self._exit_from_target
+        summary["exit_from_entry_fallback"] = self._exit_from_entry_fallback
+        summary["unmatched_close_signals"] = self._unmatched_close_signals
 
         await bt_db.close()
         return summary
@@ -363,6 +375,7 @@ class BacktestEngine:
         position = await self._find_matching_position(signal)
         if position is None:
             logger.debug("[BT] No open position for EXIT %s", signal.display_name)
+            self._unmatched_close_signals += 1
             return
 
         exit_price = await self._resolve_exit_price(position, msg_time)
@@ -380,6 +393,7 @@ class BacktestEngine:
         position = await self._find_matching_position(signal)
         if position is None:
             logger.debug("[BT] No open position for BOOK_PROFIT %s", signal.display_name)
+            self._unmatched_close_signals += 1
             return
 
         # Book profit signals often include an explicit exit price
@@ -424,6 +438,8 @@ class BacktestEngine:
         2. First target from the entry signal (if available)
         3. Entry price (break-even, last resort)
         """
+        ts = position.get("trading_symbol", "?")
+
         # Try historical price from Groww
         if position.get("strike_price") and position.get("option_type"):
             loop = asyncio.get_running_loop()
@@ -439,6 +455,7 @@ class BacktestEngine:
                 ),
             )
             if hist_price is not None:
+                self._exit_from_groww += 1
                 return hist_price
 
         # Try first target from the entry
@@ -447,11 +464,23 @@ class BacktestEngine:
             try:
                 targets = json.loads(targets_raw) if isinstance(targets_raw, str) else targets_raw
                 if targets and len(targets) > 0:
+                    self._exit_from_target += 1
+                    logger.info(
+                        "[BT] Exit price for %s: using first target ₹%.2f "
+                        "(no historical data available)",
+                        ts, float(targets[0]),
+                    )
                     return float(targets[0])
             except (json.JSONDecodeError, TypeError, IndexError):
                 pass
 
         # Last resort: break-even at entry price
+        self._exit_from_entry_fallback += 1
+        logger.warning(
+            "[BT] Exit price for %s: falling back to entry price ₹%.2f "
+            "(no historical data, no targets)",
+            ts, float(position["avg_entry_price"]),
+        )
         return float(position["avg_entry_price"])
 
     async def _close_orphaned_positions(self) -> None:

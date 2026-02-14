@@ -300,16 +300,20 @@ class Database:
         return [dict(r) for r in rows]
 
     async def get_trade_summary(self) -> dict[str, Any]:
-        """Return aggregate statistics for closed positions."""
+        """Return aggregate statistics for closed positions.
+
+        Breakeven trades (pnl = 0) are counted separately from losses.
+        """
         cursor = await self.conn.execute(
             """SELECT
-                 COUNT(*)                          AS total_trades,
-                 SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
-                 SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) AS losses,
-                 SUM(pnl)                          AS total_pnl,
-                 AVG(pnl)                          AS avg_pnl,
-                 MAX(pnl)                          AS best_trade,
-                 MIN(pnl)                          AS worst_trade
+                 COUNT(*)                                   AS total_trades,
+                 SUM(CASE WHEN pnl > 0  THEN 1 ELSE 0 END) AS wins,
+                 SUM(CASE WHEN pnl < 0  THEN 1 ELSE 0 END) AS losses,
+                 SUM(CASE WHEN pnl = 0  THEN 1 ELSE 0 END) AS breakeven,
+                 SUM(pnl)                                   AS total_pnl,
+                 AVG(pnl)                                   AS avg_pnl,
+                 MAX(pnl)                                   AS best_trade,
+                 MIN(pnl)                                   AS worst_trade
                FROM positions WHERE status = 'CLOSED'"""
         )
         row = await cursor.fetchone()
