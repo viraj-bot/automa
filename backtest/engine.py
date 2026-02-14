@@ -10,6 +10,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+import pandas as pd
+
 from config.settings import Settings
 from parser.models import (
     BookProfitSignal,
@@ -57,6 +59,7 @@ class BacktestEngine:
         self._db = db
         self._parser = SignalParser()
         self._groww: Any = None
+        self._instruments_df: Optional[pd.DataFrame] = None
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -146,22 +149,97 @@ class BacktestEngine:
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _init_groww(self) -> None:
-        """Exchange API key + secret for an access token, then create client."""
-        try:
-            from growwapi import GrowwAPI
+        """Initialise Groww API for historical data and load instruments CSV.
 
+        The instruments CSV (lot sizes) is loaded first — it's a public
+        download that doesn't require authentication.  Then we attempt the
+        API key + secret exchange for an access token needed by authenticated
+        endpoints (historical candles, etc.).
+        """
+        from growwapi import GrowwAPI
+
+        # Step 1: Load instruments CSV (public, no auth needed)
+        try:
+            tmp_api = GrowwAPI(self._settings.groww_api_token)
+            self._instruments_df = tmp_api.get_all_instruments()
+            logger.info(
+                "Loaded %d instruments (lot-size lookups enabled)",
+                len(self._instruments_df),
+            )
+        except Exception:
+            logger.warning(
+                "Could not load instruments CSV — lot sizes will default to 1",
+                exc_info=True,
+            )
+            self._instruments_df = None
+
+        # Step 2: Exchange API key + secret for access token (authenticated)
+        try:
             access_token = GrowwAPI.get_access_token(
                 api_key=self._settings.groww_api_token,
                 secret=self._settings.groww_api_secret,
             )
             self._groww = GrowwAPI(access_token)
-            logger.info("Groww API initialised for backtest historical data")
+            logger.info("Groww API authenticated — historical candle data available")
         except Exception:
             logger.warning(
-                "Could not initialise Groww API — backtest will use signal prices",
+                "Could not obtain Groww access token — backtest will use signal "
+                "prices instead of historical candles. Check GROWW_API_SECRET.",
                 exc_info=True,
             )
             self._groww = None
+
+    def _resolve_lot_size(
+        self,
+        underlying: str,
+        expiry_day: int,
+        expiry_month: str,
+        strike_price: float,
+        option_type: str,
+        at_time: datetime,
+    ) -> int:
+        """Look up the lot size for an instrument from the instruments CSV.
+
+        Returns the lot size from Groww if available, otherwise falls back to 1.
+        The final quantity is ``lot_size * default_lot_multiplier``.
+        """
+        if self._instruments_df is None:
+            return 1
+
+        month_title = _MONTH_TITLE.get(expiry_month.upper(), expiry_month.title())
+        year_short = at_time.year % 100
+
+        groww_symbol = (
+            f"NSE-{underlying}-{expiry_day:02d}{month_title}{year_short}"
+            f"-{int(strike_price)}-{option_type}"
+        )
+
+        df = self._instruments_df
+        match = df[df["groww_symbol"] == groww_symbol]
+        if not match.empty:
+            lot = int(match.iloc[0].get("lot_size", 1))
+            logger.debug(
+                "[BT] Lot size for %s: %d", groww_symbol, lot,
+            )
+            return max(lot, 1)
+
+        # Fuzzy fallback: match by underlying + strike + option type
+        if "underlying_symbol" in df.columns:
+            mask = (
+                (df["underlying_symbol"] == underlying)
+                & (df["strike_price"] == strike_price)
+                & (df["instrument_type"] == option_type)
+            )
+            fuzzy = df[mask]
+            if not fuzzy.empty:
+                lot = int(fuzzy.iloc[0].get("lot_size", 1))
+                logger.debug(
+                    "[BT] Lot size for %s (fuzzy): %d", groww_symbol, lot,
+                )
+                return max(lot, 1)
+
+        logger.debug("[BT] Lot size not found for %s, defaulting to 1", groww_symbol)
+        return 1
 
     def _get_historical_price(
         self,
@@ -244,7 +322,13 @@ class BacktestEngine:
         )
 
         fill_price = hist_price if hist_price is not None else signal.entry_price
-        quantity = self._settings.default_lot_multiplier
+
+        # Look up the real lot size from the instruments CSV
+        lot_size = self._resolve_lot_size(
+            signal.underlying, signal.expiry_day, signal.expiry_month,
+            signal.strike_price, signal.option_type.value, msg_time,
+        )
+        quantity = lot_size * self._settings.default_lot_multiplier
 
         ts = (
             f"{signal.underlying}{signal.expiry_day:02d}"

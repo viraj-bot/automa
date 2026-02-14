@@ -1,10 +1,18 @@
-"""Paper-trading broker that simulates order execution without real money."""
+"""Paper-trading broker that simulates order execution without real money.
+
+Uses the Groww instruments CSV for accurate lot sizes so that P&L
+calculations reflect real-world quantities.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Optional
+
+import pandas as pd
 
 from broker.base import BrokerInterface
 from config.settings import Settings
@@ -13,6 +21,12 @@ from storage.db import Database
 
 logger = logging.getLogger(__name__)
 
+_MONTH_MAP = {
+    "JAN": "Jan", "FEB": "Feb", "MAR": "Mar", "APR": "Apr",
+    "MAY": "May", "JUN": "Jun", "JUL": "Jul", "AUG": "Aug",
+    "SEP": "Sep", "OCT": "Oct", "NOV": "Nov", "DEC": "Dec",
+}
+
 
 class PaperBroker(BrokerInterface):
     """Simulates trades in SQLite.  No real money is involved."""
@@ -20,11 +34,31 @@ class PaperBroker(BrokerInterface):
     def __init__(self, settings: Settings, db: Database) -> None:
         self._settings = settings
         self._db = db
+        self._instruments_df: Optional[pd.DataFrame] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        logger.info("PaperBroker initialised (no real orders will be placed)")
+        """Load the Groww instruments CSV for accurate lot sizes."""
+        logger.info("PaperBroker initialising — loading instruments for lot sizes …")
+        try:
+            from growwapi import GrowwAPI
+
+            api = GrowwAPI(self._settings.groww_api_token)
+            loop = asyncio.get_running_loop()
+            self._instruments_df = await loop.run_in_executor(
+                None, api.get_all_instruments,
+            )
+            logger.info(
+                "PaperBroker loaded %d instruments (lot sizes available)",
+                len(self._instruments_df),
+            )
+        except Exception:
+            logger.warning(
+                "Could not load instruments CSV — paper trades will use lot_size=1",
+                exc_info=True,
+            )
+            self._instruments_df = None
 
     async def shutdown(self) -> None:
         logger.info("PaperBroker shut down")
@@ -39,20 +73,54 @@ class PaperBroker(BrokerInterface):
         strike_price: float,
         option_type: str,
     ) -> Optional[dict[str, Any]]:
-        """Build a synthetic trading symbol for paper trades.
+        """Build a trading symbol and look up the real lot size from Groww.
 
-        In paper mode we don't need to look up the real instruments CSV;
-        we construct a symbol that mirrors the Groww convention so that
-        the rest of the pipeline stays consistent.
+        If the instruments CSV is loaded, the lot size comes from the actual
+        Groww data.  Otherwise it falls back to 1.
         """
-        # e.g. NIFTY25FEB25600PE
+        month_title = _MONTH_MAP.get(expiry_month[:3].upper(), expiry_month[:3].title())
         month_short = expiry_month[:3].upper()
+
         ts = f"{underlying}{expiry_day:02d}{month_short}{int(strike_price)}{option_type}"
-        gs = f"NSE-{underlying}-{expiry_day:02d}{month_short}-{int(strike_price)}-{option_type}"
+
+        # Build groww_symbol for CSV lookup (e.g. NSE-NIFTY-17Feb26-25600-PE)
+        now = datetime.now()
+        candidates = [now.year % 100, (now.year + 1) % 100]
+        lot_size = 1
+        groww_sym = f"NSE-{underlying}-{expiry_day:02d}{month_title}{candidates[0]}-{int(strike_price)}-{option_type}"
+
+        if self._instruments_df is not None:
+            df = self._instruments_df
+            for yy in candidates:
+                gs = (
+                    f"NSE-{underlying}-{expiry_day:02d}{month_title}{yy}"
+                    f"-{int(strike_price)}-{option_type}"
+                )
+                match = df[df["groww_symbol"] == gs]
+                if not match.empty:
+                    lot_size = int(match.iloc[0].get("lot_size", 1))
+                    groww_sym = gs
+                    break
+            else:
+                # Fuzzy: match by underlying + strike + option type
+                if "underlying_symbol" in df.columns:
+                    mask = (
+                        (df["underlying_symbol"] == underlying)
+                        & (df["strike_price"] == strike_price)
+                        & (df["instrument_type"] == option_type)
+                    )
+                    fuzzy = df[mask]
+                    if not fuzzy.empty:
+                        lot_size = int(fuzzy.iloc[0].get("lot_size", 1))
+                        groww_sym = fuzzy.iloc[0]["groww_symbol"]
+
+        lot_size = max(lot_size, 1)
+        logger.debug("[PAPER] %s → lot_size=%d", groww_sym, lot_size)
+
         return {
             "trading_symbol": ts,
-            "groww_symbol": gs,
-            "lot_size": 1,  # will be overridden by real broker
+            "groww_symbol": groww_sym,
+            "lot_size": lot_size,
         }
 
     # ── Entry ────────────────────────────────────────────────────────────
