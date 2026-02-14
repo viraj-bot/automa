@@ -51,21 +51,56 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     if errors:
         overview.add_row("  Errors", f"[red]{errors}[/red]")
 
-    orphaned = summary.get("orphaned_positions", 0)
-    if orphaned:
-        overview.add_row("  Orphaned (force-closed)", f"[dim]{orphaned}[/dim]")
-
     console.print(overview)
     console.print()
 
-    # ── Trade statistics ─────────────────────────────────────────────────
+    # ── Per-trade table ───────────────────────────────────────────────────
+    trade_log = summary.get("trade_log", [])
     total = summary.get("total_trades", 0)
+
     if total == 0:
         console.print(
             Panel("[yellow]No closed trades to report.[/yellow]", expand=False)
         )
         return
 
+    trade_table = Table(title="Trade Log", show_lines=True)
+    trade_table.add_column("#", justify="right", style="dim", width=3)
+    trade_table.add_column("Instrument", style="bold", min_width=20)
+    trade_table.add_column("Qty", justify="right", width=5)
+    trade_table.add_column("Entry ₹", justify="right", width=10)
+    trade_table.add_column("Exit ₹", justify="right", width=10)
+    trade_table.add_column("Exit Source", width=12)
+    trade_table.add_column("Close Type", width=12)
+    trade_table.add_column("P&L ₹", justify="right", width=12)
+
+    for t in trade_log:
+        pnl = t["pnl"]
+        pnl_colour = "green" if pnl > 0 else ("red" if pnl < 0 else "dim")
+        exit_src = t["exit_source"]
+        src_colour = {
+            "groww": "green",
+            "signal": "green",
+            "target": "yellow",
+            "stoploss": "red",
+            "entry": "dim",
+        }.get(exit_src, "white")
+
+        trade_table.add_row(
+            str(t["trade_no"]),
+            t["instrument"],
+            str(t["qty"]),
+            f"{t['entry_price']:,.2f}",
+            f"{t['exit_price']:,.2f}",
+            f"[{src_colour}]{exit_src}[/{src_colour}]",
+            t["close_type"],
+            f"[{pnl_colour}]{pnl:,.2f}[/{pnl_colour}]",
+        )
+
+    console.print(trade_table)
+    console.print()
+
+    # ── Trade statistics ─────────────────────────────────────────────────
     wins = summary.get("wins", 0) or 0
     losses = summary.get("losses", 0) or 0
     breakeven = summary.get("breakeven", 0) or 0
@@ -83,8 +118,6 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     stats.add_row("Win rate", f"{win_rate:.1f}%")
 
     if wins > 0 and losses > 0:
-        # Profit factor = gross profit / gross loss
-        total_pnl = summary.get("total_pnl", 0) or 0
         best = summary.get("best_trade", 0) or 0
         worst = abs(summary.get("worst_trade", 0) or 0)
         if worst > 0:
@@ -94,77 +127,52 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     console.print()
 
     # ── Price source breakdown ────────────────────────────────────────
+    diag = Table(
+        title="Price Sources", show_header=False, box=None, padding=(0, 2)
+    )
+    diag.add_column("Metric", style="bold")
+    diag.add_column("Value", justify="right")
+
     entry_groww = summary.get("entry_from_groww", 0)
     entry_signal = summary.get("entry_from_signal", 0)
+    diag.add_row("Entries at Groww market price", f"[green]{entry_groww}[/green]")
+    diag.add_row("Entries at signal price", f"[yellow]{entry_signal}[/yellow]")
+
     exit_groww = summary.get("exit_from_groww", 0)
+    exit_signal = summary.get("exit_from_signal", 0)
     exit_target = summary.get("exit_from_target", 0)
     exit_stoploss = summary.get("exit_from_stoploss", 0)
-    exit_fallback = summary.get("exit_from_entry_fallback", 0)
+    exit_entry = summary.get("exit_from_entry", 0)
+
+    diag.add_row("Exits at Groww market price", f"[green]{exit_groww}[/green]")
+    diag.add_row("Exits at signal price (book profit)", f"[green]{exit_signal}[/green]")
+    diag.add_row("Exits at target (estimated)", f"[yellow]{exit_target}[/yellow]")
+    diag.add_row("Exits at stoploss (orphan/worst case)", f"[red]{exit_stoploss}[/red]")
+    if exit_entry:
+        diag.add_row("Exits at entry (no data)", f"[dim]{exit_entry}[/dim]")
+
     unmatched = summary.get("unmatched_close_signals", 0)
-
-    has_diag = any([
-        entry_groww, entry_signal, exit_groww, exit_target,
-        exit_stoploss, exit_fallback, unmatched,
-    ])
-    if has_diag:
-        diag = Table(
-            title="Price Sources", show_header=False, box=None, padding=(0, 2)
+    if unmatched:
+        unmatched_exit = summary.get("unmatched_exit_signals", 0)
+        unmatched_bp = summary.get("unmatched_bp_signals", 0)
+        diag.add_row("", "")
+        diag.add_row(
+            "Unmatched close signals",
+            f"[dim]{unmatched}[/dim]",
         )
-        diag.add_column("Metric", style="bold")
-        diag.add_column("Value", justify="right")
-
-        # Entry sources
-        if entry_groww or entry_signal:
+        if unmatched_exit:
             diag.add_row(
-                "Entries at Groww market price",
-                f"[green]{entry_groww}[/green]",
+                "  - Exit (position already closed)",
+                f"[dim]{unmatched_exit}[/dim]",
             )
+        if unmatched_bp:
             diag.add_row(
-                "Entries at signal price (no market data)",
-                f"[yellow]{entry_signal}[/yellow]",
+                "  - Book profit (P&L may be lost)",
+                f"[yellow]{unmatched_bp}[/yellow]",
             )
 
-        # Exit sources
-        if exit_groww:
-            diag.add_row(
-                "Exits at Groww market price",
-                f"[green]{exit_groww}[/green]",
-            )
-        if exit_target:
-            diag.add_row(
-                "Exits at target (book-profit, no market data)",
-                f"[yellow]{exit_target}[/yellow]",
-            )
-        if exit_stoploss:
-            diag.add_row(
-                "Exits at stoploss (exit/orphan, no market data)",
-                f"[red]{exit_stoploss}[/red]",
-            )
-        if exit_fallback:
-            diag.add_row(
-                "Exits at entry price (no data, no SL)",
-                f"[dim]{exit_fallback}[/dim]",
-            )
-        if unmatched:
-            unmatched_exit = summary.get("unmatched_exit_signals", 0)
-            unmatched_bp = summary.get("unmatched_bp_signals", 0)
-            diag.add_row(
-                "Unmatched close signals (no open position)",
-                f"[dim]{unmatched}[/dim]",
-            )
-            if unmatched_exit:
-                diag.add_row(
-                    "  - Exit signals (position already closed)",
-                    f"[dim]{unmatched_exit}[/dim]",
-                )
-            if unmatched_bp:
-                diag.add_row(
-                    "  - Book profit signals (P&L may be lost)",
-                    f"[yellow]{unmatched_bp}[/yellow]",
-                )
-
-        console.print(diag)
-        console.print()
+    console.print(diag)
+    console.print()
 
     # ── P&L table ────────────────────────────────────────────────────────
     pnl_table = Table(title="Profit & Loss", show_header=False, box=None, padding=(0, 2))

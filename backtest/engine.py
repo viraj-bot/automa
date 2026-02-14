@@ -61,16 +61,13 @@ class BacktestEngine:
         self._groww: Any = None
         self._instruments_df: Optional[pd.DataFrame] = None
 
-        # Counters for price source tracking
-        self._entry_from_groww = 0       # entries filled at Groww market price
-        self._entry_from_signal = 0      # entries filled at signal price (no data)
-        self._exit_from_groww = 0        # exits at Groww market price
-        self._exit_from_target = 0       # exits using target price (no market data)
-        self._exit_from_stoploss = 0     # orphans using stoploss price
-        self._exit_from_entry_fallback = 0  # last-resort break-even at entry
+        # ── Trade log: every closed trade is recorded here ──
+        self._trade_log: list[dict[str, Any]] = []
+
+        # Counters
         self._unmatched_close_signals = 0
-        self._unmatched_exit_signals = 0   # exit signals with no matching position
-        self._unmatched_bp_signals = 0     # book-profit signals with no matching position
+        self._unmatched_exit_signals = 0
+        self._unmatched_bp_signals = 0
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -176,36 +173,62 @@ class BacktestEngine:
         # Force-close orphaned open positions at stoploss or entry price
         await self._close_orphaned_positions()
 
-        # 5. Summary
-        summary = await self._db.get_trade_summary()
-        summary["total_messages"] = len(messages)
-        summary["total_signals"] = parsed_count
-        summary["entries"] = entry_count
-        summary["exits"] = exit_count
-        summary["book_profits"] = bp_count
-        summary["errors"] = errors
+        # 5. Build summary from the trade log
+        trades = self._trade_log
+        total_trades = len(trades)
+        wins = sum(1 for t in trades if t["pnl"] > 0)
+        losses = sum(1 for t in trades if t["pnl"] < 0)
+        breakeven = sum(1 for t in trades if t["pnl"] == 0)
+        total_pnl = sum(t["pnl"] for t in trades)
+        avg_pnl = total_pnl / total_trades if total_trades else 0
+        best_trade = max((t["pnl"] for t in trades), default=0)
+        worst_trade = min((t["pnl"] for t in trades), default=0)
 
-        # Count still-open positions (shouldn't be any after force-close)
-        open_positions = await self._db.get_all_positions(status="OPEN")
-        summary["orphaned_positions"] = len(open_positions)
-        summary["unparsed_messages"] = unparsed_count
+        # Price source counts from the trade log
+        entry_from_groww = sum(1 for t in trades if t["entry_source"] == "groww")
+        entry_from_signal = sum(1 for t in trades if t["entry_source"] == "signal")
+        exit_from_groww = sum(1 for t in trades if t["exit_source"] == "groww")
+        exit_from_signal = sum(1 for t in trades if t["exit_source"] == "signal")
+        exit_from_target = sum(1 for t in trades if t["exit_source"] == "target")
+        exit_from_stoploss = sum(1 for t in trades if t["exit_source"] == "stoploss")
+        exit_from_entry = sum(1 for t in trades if t["exit_source"] == "entry")
 
-        # Price source breakdown
-        summary["entry_from_groww"] = self._entry_from_groww
-        summary["entry_from_signal"] = self._entry_from_signal
-        summary["exit_from_groww"] = self._exit_from_groww
-        summary["exit_from_target"] = self._exit_from_target
-        summary["exit_from_stoploss"] = self._exit_from_stoploss
-        summary["exit_from_entry_fallback"] = self._exit_from_entry_fallback
-        summary["unmatched_close_signals"] = self._unmatched_close_signals
-        summary["unmatched_exit_signals"] = self._unmatched_exit_signals
-        summary["unmatched_bp_signals"] = self._unmatched_bp_signals
-
-        # Entry quality breakdown
-        summary["entries_with_targets"] = entries_with_targets
-        summary["entries_without_targets"] = entries_without_targets
-        summary["bp_with_price"] = bp_with_price
-        summary["bp_without_price"] = bp_without_price
+        summary: dict[str, Any] = {
+            "total_messages": len(messages),
+            "total_signals": parsed_count,
+            "entries": entry_count,
+            "exits": exit_count,
+            "book_profits": bp_count,
+            "errors": errors,
+            "unparsed_messages": unparsed_count,
+            "entries_with_targets": entries_with_targets,
+            "entries_without_targets": entries_without_targets,
+            "bp_with_price": bp_with_price,
+            "bp_without_price": bp_without_price,
+            # Trade stats (computed from trade log)
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "breakeven": breakeven,
+            "total_pnl": total_pnl,
+            "avg_pnl": avg_pnl,
+            "best_trade": best_trade,
+            "worst_trade": worst_trade,
+            # Price sources
+            "entry_from_groww": entry_from_groww,
+            "entry_from_signal": entry_from_signal,
+            "exit_from_groww": exit_from_groww,
+            "exit_from_signal": exit_from_signal,
+            "exit_from_target": exit_from_target,
+            "exit_from_stoploss": exit_from_stoploss,
+            "exit_from_entry": exit_from_entry,
+            # Unmatched
+            "unmatched_close_signals": self._unmatched_close_signals,
+            "unmatched_exit_signals": self._unmatched_exit_signals,
+            "unmatched_bp_signals": self._unmatched_bp_signals,
+            # The full trade log for per-trade reporting
+            "trade_log": trades,
+        }
 
         await bt_db.close()
         return summary
@@ -494,18 +517,10 @@ class BacktestEngine:
 
         if hist_price is not None:
             fill_price = hist_price
-            self._entry_from_groww += 1
-            logger.info(
-                "[BT] ENTRY %s: using Groww market price ₹%.2f (signal: ₹%.2f)",
-                signal.display_name, fill_price, signal.entry_price,
-            )
+            entry_source = "groww"
         else:
             fill_price = signal.entry_price
-            self._entry_from_signal += 1
-            logger.info(
-                "[BT] ENTRY %s: using signal price ₹%.2f (no Groww data)",
-                signal.display_name, fill_price,
-            )
+            entry_source = "signal"
 
         # Look up the real lot size from the instruments CSV
         lot_size = self._resolve_lot_size(
@@ -536,20 +551,14 @@ class BacktestEngine:
         )
 
         logger.info(
-            "[BT] ENTRY %s x%d @ ₹%.2f (signal: ₹%.2f, SL: %s, T: %s)",
-            signal.display_name, quantity, fill_price, signal.entry_price,
-            signal.stoploss, signal.targets,
+            "[BT] ENTRY %s x%d @ ₹%.2f (%s) | signal=₹%.2f SL=%s T=%s",
+            signal.display_name, quantity, fill_price, entry_source,
+            signal.entry_price, signal.stoploss, signal.targets,
         )
 
     async def _simulate_exit(
         self, signal: ExitSignal, signal_id: int, msg_time: datetime
     ) -> None:
-        logger.debug(
-            "[BT] Looking for EXIT match: underlying=%r strike=%s otype=%s day=%s month=%s",
-            signal.underlying, signal.strike_price,
-            signal.option_type.value if signal.option_type else None,
-            signal.expiry_day, signal.expiry_month,
-        )
         position = await self._find_matching_position(signal)
         if position is None:
             logger.warning("[BT] No open position for EXIT %s", signal.display_name)
@@ -557,26 +566,37 @@ class BacktestEngine:
             self._unmatched_exit_signals += 1
             return
 
-        exit_price = await self._resolve_exit_price(
+        entry_price = float(position["avg_entry_price"])
+        quantity = int(position["quantity"])
+        exit_price, exit_source = await self._resolve_exit_price(
             position, msg_time, close_reason="EXIT",
         )
-        pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
+        pnl = (exit_price - entry_price) * quantity
         await self._db.close_position(position["id"], pnl=pnl)
 
+        self._trade_log.append({
+            "trade_no": len(self._trade_log) + 1,
+            "instrument": position["trading_symbol"],
+            "underlying": position["underlying"],
+            "qty": quantity,
+            "entry_price": entry_price,
+            "entry_source": "signal",  # stored at entry time
+            "exit_price": exit_price,
+            "exit_source": exit_source,
+            "close_type": "EXIT",
+            "pnl": pnl,
+            "entry_time": position.get("opened_at", ""),
+            "exit_time": msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time),
+        })
+
         logger.info(
-            "[BT] EXIT %s  entry=₹%.2f  exit=₹%.2f  P&L=₹%.2f",
-            position["trading_symbol"], position["avg_entry_price"], exit_price, pnl,
+            "[BT] EXIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
+            position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
         )
 
     async def _simulate_book_profit(
         self, signal: BookProfitSignal, signal_id: int, msg_time: datetime
     ) -> None:
-        logger.debug(
-            "[BT] Looking for BOOK_PROFIT match: underlying=%r strike=%s otype=%s day=%s month=%s exit_price=%s",
-            signal.underlying, signal.strike_price,
-            signal.option_type.value if signal.option_type else None,
-            signal.expiry_day, signal.expiry_month, signal.exit_price,
-        )
         position = await self._find_matching_position(signal)
         if position is None:
             logger.warning(
@@ -587,20 +607,39 @@ class BacktestEngine:
             self._unmatched_bp_signals += 1
             return
 
+        entry_price = float(position["avg_entry_price"])
+        quantity = int(position["quantity"])
+
         # Book profit signals often include an explicit exit price
         if signal.exit_price is not None:
-            exit_price = signal.exit_price
+            exit_price = float(signal.exit_price)
+            exit_source = "signal"  # explicit price from the message
         else:
-            exit_price = await self._resolve_exit_price(
+            exit_price, exit_source = await self._resolve_exit_price(
                 position, msg_time, close_reason="BOOK_PROFIT",
             )
 
-        pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
+        pnl = (exit_price - entry_price) * quantity
         await self._db.close_position(position["id"], pnl=pnl)
 
+        self._trade_log.append({
+            "trade_no": len(self._trade_log) + 1,
+            "instrument": position["trading_symbol"],
+            "underlying": position["underlying"],
+            "qty": quantity,
+            "entry_price": entry_price,
+            "entry_source": "signal",
+            "exit_price": exit_price,
+            "exit_source": exit_source,
+            "close_type": "BOOK_PROFIT",
+            "pnl": pnl,
+            "entry_time": position.get("opened_at", ""),
+            "exit_time": msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time),
+        })
+
         logger.info(
-            "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f  P&L=₹%.2f",
-            position["trading_symbol"], position["avg_entry_price"], exit_price, pnl,
+            "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
+            position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────
@@ -693,28 +732,15 @@ class BacktestEngine:
     async def _resolve_exit_price(
         self, position: dict, msg_time: datetime,
         *, close_reason: str = "EXIT",
-    ) -> float:
-        """Determine the exit price for a position, trying multiple sources.
+    ) -> tuple[float, str]:
+        """Determine the exit price for a position.
 
-        ``close_reason`` controls fallback behaviour when no market data is
-        available:
+        Returns ``(price, source)`` where *source* is one of:
+        ``"groww"``, ``"target"``, ``"stoploss"``, ``"entry"``.
 
-        * ``"BOOK_PROFIT"`` — the signal explicitly says profit was booked,
-          so using the first target is a reasonable estimate.
-        * ``"EXIT"`` — the admin actively told members to exit. This is an
-          intentional close, so the exit price is likely near the target
-          (admin monitors and exits at a reasonable level). Use target as
-          the best estimate.
-        * ``"ORPHAN"`` — position was never explicitly closed; assume worst
-          case (stoploss) since no one called an exit.
-
-        Priority (common):
-        1. Groww historical candle price at the exit time.
-
-        Then, depending on close_reason:
-        - BOOK_PROFIT: target → entry
-        - EXIT:        target → entry  (admin actively managed the exit)
-        - ORPHAN:      stoploss → entry (no exit signal = likely bad outcome)
+        Fallback logic:
+        - BOOK_PROFIT / EXIT: groww → target → stoploss → entry
+        - ORPHAN:             groww → stoploss → entry
         """
         ts = position.get("trading_symbol", "?")
         entry = float(position["avg_entry_price"])
@@ -734,12 +760,9 @@ class BacktestEngine:
                 ),
             )
             if hist_price is not None:
-                self._exit_from_groww += 1
-                return hist_price
+                return hist_price, "groww"
 
-        # ── 2. Fallback depends on close_reason ──
-
-        # Parse helpers
+        # ── 2. Parse helpers ──
         targets_raw = position.get("targets")
         first_target = None
         if targets_raw:
@@ -753,56 +776,37 @@ class BacktestEngine:
         stoploss = position.get("stoploss")
         stoploss_val = float(stoploss) if stoploss is not None and float(stoploss) > 0 else None
 
+        # ── 3. Fallback depends on close_reason ──
         if close_reason in ("BOOK_PROFIT", "EXIT"):
-            # Both BOOK_PROFIT and EXIT are actively managed by the admin.
-            # The admin sends these signals when they decide to close —
-            # the first target is the best estimate of where they exited.
             if first_target is not None:
-                self._exit_from_target += 1
                 logger.info(
-                    "[BT] Exit price for %s (%s): using first target ₹%.2f "
-                    "(no historical data)",
+                    "[BT] Exit %s (%s): target ₹%.2f (no Groww data)",
                     ts, close_reason, first_target,
                 )
-                return first_target
-            # No target — try stoploss as a conservative fallback
+                return first_target, "target"
             if stoploss_val is not None:
-                self._exit_from_stoploss += 1
                 logger.info(
-                    "[BT] Exit price for %s (%s): no target, using stoploss ₹%.2f",
+                    "[BT] Exit %s (%s): stoploss ₹%.2f (no target)",
                     ts, close_reason, stoploss_val,
                 )
-                return stoploss_val
-
+                return stoploss_val, "stoploss"
         else:
-            # ORPHAN — position was never closed by any signal.
-            # Assume worst case: hit stoploss.
+            # ORPHAN — assume worst case
             if stoploss_val is not None:
-                self._exit_from_stoploss += 1
                 logger.info(
-                    "[BT] Exit price for %s (ORPHAN): using stoploss ₹%.2f "
-                    "(no exit signal received)",
+                    "[BT] Exit %s (ORPHAN): stoploss ₹%.2f",
                     ts, stoploss_val,
                 )
-                return stoploss_val
+                return stoploss_val, "stoploss"
 
-        # ── 3. Absolute last resort: break-even at entry price ──
-        self._exit_from_entry_fallback += 1
         logger.warning(
-            "[BT] Exit price for %s (%s): falling back to entry price ₹%.2f "
-            "(no historical data, no target, no stoploss)",
+            "[BT] Exit %s (%s): entry ₹%.2f (no data at all)",
             ts, close_reason, entry,
         )
-        return entry
+        return entry, "entry"
 
     async def _close_orphaned_positions(self) -> None:
-        """Force-close any positions that were never explicitly exited.
-
-        Priority for exit price:
-        1. Stoploss (worst-case scenario)
-        2. First target (optimistic estimate if no stoploss)
-        3. Entry price (break-even, last resort)
-        """
+        """Force-close positions that were never explicitly exited."""
         open_positions = await self._db.get_all_positions(status="OPEN")
         if not open_positions:
             return
@@ -813,24 +817,36 @@ class BacktestEngine:
         )
 
         for pos in open_positions:
-            entry = pos["avg_entry_price"]
+            entry = float(pos["avg_entry_price"])
+            quantity = int(pos["quantity"])
             stoploss = pos.get("stoploss")
-            source = "entry (break-even)"
 
             if stoploss is not None and float(stoploss) > 0:
-                # Assume worst case — hit stoploss (no exit signal = likely bad outcome)
                 exit_price = float(stoploss)
-                source = "stoploss"
-                self._exit_from_stoploss += 1
+                exit_source = "stoploss"
             else:
-                # No stoploss available — break-even at entry
                 exit_price = entry
-                self._exit_from_entry_fallback += 1
+                exit_source = "entry"
 
-            pnl = (exit_price - entry) * pos["quantity"]
+            pnl = (exit_price - entry) * quantity
             await self._db.close_position(pos["id"], pnl=pnl)
+
+            self._trade_log.append({
+                "trade_no": len(self._trade_log) + 1,
+                "instrument": pos["trading_symbol"],
+                "underlying": pos["underlying"],
+                "qty": quantity,
+                "entry_price": entry,
+                "entry_source": "signal",
+                "exit_price": exit_price,
+                "exit_source": exit_source,
+                "close_type": "ORPHAN",
+                "pnl": pnl,
+                "entry_time": pos.get("opened_at", ""),
+                "exit_time": "force-closed",
+            })
 
             logger.info(
                 "[BT] FORCE-CLOSE %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
-                pos["trading_symbol"], entry, exit_price, source, pnl,
+                pos["trading_symbol"], entry, exit_price, exit_source, pnl,
             )
