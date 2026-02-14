@@ -65,10 +65,12 @@ class BacktestEngine:
         self._entry_from_groww = 0       # entries filled at Groww market price
         self._entry_from_signal = 0      # entries filled at signal price (no data)
         self._exit_from_groww = 0        # exits at Groww market price
-        self._exit_from_target = 0       # book-profit exits using target price
-        self._exit_from_stoploss = 0     # exits/orphans using stoploss price
+        self._exit_from_target = 0       # exits using target price (no market data)
+        self._exit_from_stoploss = 0     # orphans using stoploss price
         self._exit_from_entry_fallback = 0  # last-resort break-even at entry
         self._unmatched_close_signals = 0
+        self._unmatched_exit_signals = 0   # exit signals with no matching position
+        self._unmatched_bp_signals = 0     # book-profit signals with no matching position
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -196,6 +198,8 @@ class BacktestEngine:
         summary["exit_from_stoploss"] = self._exit_from_stoploss
         summary["exit_from_entry_fallback"] = self._exit_from_entry_fallback
         summary["unmatched_close_signals"] = self._unmatched_close_signals
+        summary["unmatched_exit_signals"] = self._unmatched_exit_signals
+        summary["unmatched_bp_signals"] = self._unmatched_bp_signals
 
         # Entry quality breakdown
         summary["entries_with_targets"] = entries_with_targets
@@ -550,6 +554,7 @@ class BacktestEngine:
         if position is None:
             logger.warning("[BT] No open position for EXIT %s", signal.display_name)
             self._unmatched_close_signals += 1
+            self._unmatched_exit_signals += 1
             return
 
         exit_price = await self._resolve_exit_price(
@@ -574,8 +579,12 @@ class BacktestEngine:
         )
         position = await self._find_matching_position(signal)
         if position is None:
-            logger.warning("[BT] No open position for BOOK_PROFIT %s", signal.display_name)
+            logger.warning(
+                "[BT] No open position for BOOK_PROFIT %s (exit_price=₹%s) — P&L LOST",
+                signal.display_name, signal.exit_price,
+            )
             self._unmatched_close_signals += 1
+            self._unmatched_bp_signals += 1
             return
 
         # Book profit signals often include an explicit exit price
@@ -692,18 +701,20 @@ class BacktestEngine:
 
         * ``"BOOK_PROFIT"`` — the signal explicitly says profit was booked,
           so using the first target is a reasonable estimate.
-        * ``"EXIT"`` — a plain exit (could be a stop-loss hit), so we
-          conservatively use the stoploss as the fallback.
+        * ``"EXIT"`` — the admin actively told members to exit. This is an
+          intentional close, so the exit price is likely near the target
+          (admin monitors and exits at a reasonable level). Use target as
+          the best estimate.
         * ``"ORPHAN"`` — position was never explicitly closed; assume worst
-          case (stoploss).
+          case (stoploss) since no one called an exit.
 
         Priority (common):
         1. Groww historical candle price at the exit time.
 
         Then, depending on close_reason:
-        - BOOK_PROFIT: target → stoploss → entry
-        - EXIT:        stoploss → entry
-        - ORPHAN:      stoploss → entry
+        - BOOK_PROFIT: target → entry
+        - EXIT:        target → entry  (admin actively managed the exit)
+        - ORPHAN:      stoploss → entry (no exit signal = likely bad outcome)
         """
         ts = position.get("trading_symbol", "?")
         entry = float(position["avg_entry_price"])
@@ -742,32 +753,36 @@ class BacktestEngine:
         stoploss = position.get("stoploss")
         stoploss_val = float(stoploss) if stoploss is not None and float(stoploss) > 0 else None
 
-        if close_reason == "BOOK_PROFIT":
-            # Signal says profit was booked → target is a fair estimate
+        if close_reason in ("BOOK_PROFIT", "EXIT"):
+            # Both BOOK_PROFIT and EXIT are actively managed by the admin.
+            # The admin sends these signals when they decide to close —
+            # the first target is the best estimate of where they exited.
             if first_target is not None:
                 self._exit_from_target += 1
                 logger.info(
-                    "[BT] Exit price for %s (BOOK_PROFIT): using first target ₹%.2f",
-                    ts, first_target,
+                    "[BT] Exit price for %s (%s): using first target ₹%.2f "
+                    "(no historical data)",
+                    ts, close_reason, first_target,
                 )
                 return first_target
-            # No target available — try stoploss as conservative fallback
+            # No target — try stoploss as a conservative fallback
             if stoploss_val is not None:
                 self._exit_from_stoploss += 1
                 logger.info(
-                    "[BT] Exit price for %s (BOOK_PROFIT): no target, using stoploss ₹%.2f",
-                    ts, stoploss_val,
+                    "[BT] Exit price for %s (%s): no target, using stoploss ₹%.2f",
+                    ts, close_reason, stoploss_val,
                 )
                 return stoploss_val
 
         else:
-            # EXIT or ORPHAN — trade may have gone wrong; use stoploss
+            # ORPHAN — position was never closed by any signal.
+            # Assume worst case: hit stoploss.
             if stoploss_val is not None:
                 self._exit_from_stoploss += 1
                 logger.info(
-                    "[BT] Exit price for %s (%s): using stoploss ₹%.2f "
-                    "(no historical data)",
-                    ts, close_reason, stoploss_val,
+                    "[BT] Exit price for %s (ORPHAN): using stoploss ₹%.2f "
+                    "(no exit signal received)",
+                    ts, stoploss_val,
                 )
                 return stoploss_val
 
@@ -775,7 +790,7 @@ class BacktestEngine:
         self._exit_from_entry_fallback += 1
         logger.warning(
             "[BT] Exit price for %s (%s): falling back to entry price ₹%.2f "
-            "(no historical data, no stoploss)",
+            "(no historical data, no target, no stoploss)",
             ts, close_reason, entry,
         )
         return entry

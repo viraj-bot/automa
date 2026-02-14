@@ -146,10 +146,22 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
                 f"[dim]{exit_fallback}[/dim]",
             )
         if unmatched:
+            unmatched_exit = summary.get("unmatched_exit_signals", 0)
+            unmatched_bp = summary.get("unmatched_bp_signals", 0)
             diag.add_row(
                 "Unmatched close signals (no open position)",
                 f"[dim]{unmatched}[/dim]",
             )
+            if unmatched_exit:
+                diag.add_row(
+                    "  - Exit signals (position already closed)",
+                    f"[dim]{unmatched_exit}[/dim]",
+                )
+            if unmatched_bp:
+                diag.add_row(
+                    "  - Book profit signals (P&L may be lost)",
+                    f"[yellow]{unmatched_bp}[/yellow]",
+                )
 
         console.print(diag)
         console.print()
