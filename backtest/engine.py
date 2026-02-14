@@ -31,81 +31,6 @@ _MONTH_TITLE = {
     "SEP": "Sep", "OCT": "Oct", "NOV": "Nov", "DEC": "Dec",
 }
 
-# Well-known F&O lot sizes (as of 2025-2026).
-# Used as fallback when the instruments CSV lookup fails.
-_KNOWN_LOT_SIZES: dict[str, int] = {
-    "NIFTY": 25,
-    "NIFTY50": 25,
-    "BANKNIFTY": 15,
-    "FINNIFTY": 25,
-    "MIDCPNIFTY": 50,
-    "SENSEX": 10,
-    "BANKEX": 15,
-    # Stocks — add common ones that appear in the group
-    "TATAPOWER": 1125,
-    "RELIANCE": 250,
-    "TCS": 175,
-    "INFY": 300,
-    "HDFCBANK": 550,
-    "ICICIBANK": 700,
-    "SBIN": 750,
-    "TATAMOTORS": 575,
-    "TATASTEEL": 550,
-    "ITC": 1600,
-    "BAJFINANCE": 125,
-    "AXISBANK": 625,
-    "MARUTI": 50,
-    "LT": 150,
-    "SUNPHARMA": 700,
-    "WIPRO": 1500,
-    "TECHM": 300,
-    "HCLTECH": 350,
-    "ADANIENT": 250,
-    "ADANIPORTS": 1250,
-    "BHARTIARTL": 475,
-    "COALINDIA": 2100,
-    "HINDALCO": 1075,
-    "HINDUNILVR": 300,
-    "JSWSTEEL": 675,
-    "KOTAKBANK": 400,
-    "NTPC": 1500,
-    "ONGC": 3075,
-    "POWERGRID": 1900,
-    "ULTRACEMCO": 50,
-    "TITAN": 375,
-    "NESTLEIND": 50,
-    "DIVISLAB": 100,
-    "DRREDDY": 125,
-    "CIPLA": 650,
-    "APOLLOHOSP": 125,
-    "EICHERMOT": 175,
-    "HEROMOTOCO": 150,
-    "BAJAJ-AUTO": 125,
-    "INDUSINDBK": 450,
-    "TRENT": 100,
-    "VOLTAS": 375,
-    "AMBER": 100,
-    "ASTRAL": 425,
-    "VBL": 1125,
-    "SHRIRAMFIN": 825,
-    "HINDZINC": 1225,
-    "JINDALSTEL": 625,
-    "UPL": 1355,
-    "ADANIGREEN": 600,
-    "JUBLFOOD": 1250,
-    "JIOFIN": 2350,
-    "APLAPOLLO": 350,
-    "LTF": 2250,
-    "PNBHOUSING": 650,
-    "TVSMOTOR": 175,
-    "SONACOMS": 1225,
-    "GODREJPROP": 275,
-    "BEL": 1425,
-    "INDHOTEL": 1000,
-    "NYKAA": 3125,
-    "COFORGE": 200,
-    "PERSISTENT": 150,
-}
 
 
 class BacktestEngine:
@@ -136,6 +61,7 @@ class BacktestEngine:
         self._parser = SignalParser()
         self._groww: Any = None
         self._instruments_df: Optional[pd.DataFrame] = None
+        self._lot_size_cache: Optional[dict[str, int]] = None  # underlying → lot size
 
         # ── Trade log: every closed trade is recorded here ──
         self._trade_log: list[dict[str, Any]] = []
@@ -322,19 +248,38 @@ class BacktestEngine:
         from growwapi import GrowwAPI
 
         # Step 1: Load instruments CSV (public, no auth needed)
+        # Build a lot-size cache: underlying_symbol → lot_size
         try:
             tmp_api = GrowwAPI(self._settings.groww_api_token)
             self._instruments_df = tmp_api.get_all_instruments()
             logger.info(
-                "Loaded %d instruments (lot-size lookups enabled)",
+                "Loaded %d instruments from Groww",
                 len(self._instruments_df),
             )
+
+            # Build lot-size cache by underlying symbol
+            df = self._instruments_df
+            if "underlying_symbol" in df.columns and "lot_size" in df.columns:
+                cache: dict[str, int] = {}
+                for _, row in df[["underlying_symbol", "lot_size"]].drop_duplicates(
+                    subset=["underlying_symbol"]
+                ).iterrows():
+                    sym = str(row["underlying_symbol"]).upper()
+                    lot = int(row["lot_size"])
+                    if lot > 0:
+                        cache[sym] = lot
+                self._lot_size_cache = cache
+                logger.info(
+                    "Built lot-size cache for %d underlyings (e.g. NIFTY=%s, BANKNIFTY=%s)",
+                    len(cache),
+                    cache.get("NIFTY", "?"),
+                    cache.get("BANKNIFTY", "?"),
+                )
         except Exception:
             logger.warning(
                 "Could not load instruments CSV — lot sizes will default to 1",
                 exc_info=True,
             )
-            self._instruments_df = None
 
         # Step 2: Exchange API key + secret for access token (authenticated)
         try:
@@ -361,56 +306,23 @@ class BacktestEngine:
         option_type: str,
         at_time: datetime,
     ) -> int:
-        """Look up the lot size for an instrument from the instruments CSV.
+        """Look up the lot size for an instrument from the Groww instruments CSV.
+
+        The lot size is the same for all instruments of a given underlying,
+        so we look up by underlying_symbol rather than exact groww_symbol
+        (which may not exist for expired instruments).
 
         Returns the lot size from Groww if available, otherwise falls back to 1.
-        The final quantity is ``lot_size * default_lot_multiplier``.
         """
-        if self._instruments_df is None:
-            return 1
+        # Try the cached lot-size map first (built from instruments CSV)
+        if self._lot_size_cache is not None:
+            lot = self._lot_size_cache.get(underlying.upper())
+            if lot is not None:
+                return lot
 
-        month_title = _MONTH_TITLE.get(expiry_month.upper(), expiry_month.title())
-        year_short = at_time.year % 100
-
-        groww_symbol = (
-            f"NSE-{underlying}-{expiry_day:02d}{month_title}{year_short}"
-            f"-{int(strike_price)}-{option_type}"
+        logger.warning(
+            "[BT] Lot size not found for %s, defaulting to 1", underlying,
         )
-
-        df = self._instruments_df
-        match = df[df["groww_symbol"] == groww_symbol]
-        if not match.empty:
-            lot = int(match.iloc[0].get("lot_size", 1))
-            logger.debug(
-                "[BT] Lot size for %s: %d", groww_symbol, lot,
-            )
-            return max(lot, 1)
-
-        # Fuzzy fallback: match by underlying + strike + option type
-        if "underlying_symbol" in df.columns:
-            mask = (
-                (df["underlying_symbol"] == underlying)
-                & (df["strike_price"] == strike_price)
-                & (df["instrument_type"] == option_type)
-            )
-            fuzzy = df[mask]
-            if not fuzzy.empty:
-                lot = int(fuzzy.iloc[0].get("lot_size", 1))
-                logger.debug(
-                    "[BT] Lot size for %s (fuzzy): %d", groww_symbol, lot,
-                )
-                return max(lot, 1)
-
-        # Fallback: well-known lot sizes
-        if underlying.upper() in _KNOWN_LOT_SIZES:
-            lot = _KNOWN_LOT_SIZES[underlying.upper()]
-            logger.debug(
-                "[BT] Lot size for %s: %d (from known lot sizes table)",
-                groww_symbol, lot,
-            )
-            return lot
-
-        logger.warning("[BT] Lot size not found for %s, defaulting to 1", groww_symbol)
         return 1
 
     def _build_groww_symbol(
