@@ -132,7 +132,24 @@ class BacktestEngine:
                 logger.exception("Error processing signal")
                 errors += 1
 
-        # 4. Force-close orphaned open positions at stoploss or entry price
+        # 4. Log open positions before force-closing (diagnostic)
+        pre_close_open = await self._db.get_all_positions(status="OPEN")
+        if pre_close_open:
+            logger.info(
+                "[BT] %d positions still open before force-close:",
+                len(pre_close_open),
+            )
+            for p in pre_close_open:
+                logger.info(
+                    "  -> id=%s underlying=%r ts=%s strike=%s otype=%s "
+                    "day=%s month=%s entry=₹%.2f targets=%s sl=%s",
+                    p["id"], p["underlying"], p["trading_symbol"],
+                    p.get("strike_price"), p.get("option_type"),
+                    p.get("expiry_day"), p.get("expiry_month"),
+                    p["avg_entry_price"], p.get("targets"), p.get("stoploss"),
+                )
+
+        # Force-close orphaned open positions at stoploss or entry price
         await self._close_orphaned_positions()
 
         # 5. Summary
@@ -372,9 +389,15 @@ class BacktestEngine:
     async def _simulate_exit(
         self, signal: ExitSignal, signal_id: int, msg_time: datetime
     ) -> None:
+        logger.debug(
+            "[BT] Looking for EXIT match: underlying=%r strike=%s otype=%s day=%s month=%s",
+            signal.underlying, signal.strike_price,
+            signal.option_type.value if signal.option_type else None,
+            signal.expiry_day, signal.expiry_month,
+        )
         position = await self._find_matching_position(signal)
         if position is None:
-            logger.debug("[BT] No open position for EXIT %s", signal.display_name)
+            logger.warning("[BT] No open position for EXIT %s", signal.display_name)
             self._unmatched_close_signals += 1
             return
 
@@ -390,9 +413,15 @@ class BacktestEngine:
     async def _simulate_book_profit(
         self, signal: BookProfitSignal, signal_id: int, msg_time: datetime
     ) -> None:
+        logger.debug(
+            "[BT] Looking for BOOK_PROFIT match: underlying=%r strike=%s otype=%s day=%s month=%s exit_price=%s",
+            signal.underlying, signal.strike_price,
+            signal.option_type.value if signal.option_type else None,
+            signal.expiry_day, signal.expiry_month, signal.exit_price,
+        )
         position = await self._find_matching_position(signal)
         if position is None:
-            logger.debug("[BT] No open position for BOOK_PROFIT %s", signal.display_name)
+            logger.warning("[BT] No open position for BOOK_PROFIT %s", signal.display_name)
             self._unmatched_close_signals += 1
             return
 
@@ -413,20 +442,89 @@ class BacktestEngine:
     # ── Helpers ──────────────────────────────────────────────────────────
 
     async def _find_matching_position(self, signal: ExitSignal | BookProfitSignal) -> Optional[dict]:
-        """Find the best matching open position for an exit/book-profit signal."""
+        """Find the best matching open position for an exit/book-profit signal.
+
+        Tries progressively broader matching:
+        1. Exact match on all available fields (underlying, strike, otype, expiry)
+        2. Match on underlying + strike + option_type only
+        3. Match on underlying + option_type only
+        4. Match on underlying only
+        """
+        sig_underlying = signal.underlying
+        sig_strike = signal.strike_price
+        sig_otype = signal.option_type.value if signal.option_type else None
+        sig_day = signal.expiry_day
+        sig_month = signal.expiry_month
+
+        # 1. Exact match with all available fields
         position = await self._db.find_open_position(
-            underlying=signal.underlying,
-            strike_price=signal.strike_price,
-            option_type=signal.option_type.value if signal.option_type else None,
-            expiry_day=signal.expiry_day,
-            expiry_month=signal.expiry_month,
+            underlying=sig_underlying,
+            strike_price=sig_strike,
+            option_type=sig_otype,
+            expiry_day=sig_day,
+            expiry_month=sig_month,
         )
         if position is not None:
+            logger.debug(
+                "[BT] MATCH (exact) for %s: pos_id=%s ts=%s",
+                signal.display_name, position["id"], position["trading_symbol"],
+            )
             return position
 
-        # Broader match — just by underlying
-        positions = await self._db.find_all_open_positions_for_underlying(signal.underlying)
-        return positions[0] if positions else None
+        # 2. Match on underlying + strike + option_type (ignore expiry)
+        if sig_strike is not None and sig_otype is not None:
+            position = await self._db.find_open_position(
+                underlying=sig_underlying,
+                strike_price=sig_strike,
+                option_type=sig_otype,
+            )
+            if position is not None:
+                logger.debug(
+                    "[BT] MATCH (strike+otype) for %s: pos_id=%s ts=%s",
+                    signal.display_name, position["id"], position["trading_symbol"],
+                )
+                return position
+
+        # 3. Match on underlying + option_type only
+        if sig_otype is not None:
+            position = await self._db.find_open_position(
+                underlying=sig_underlying,
+                option_type=sig_otype,
+            )
+            if position is not None:
+                logger.debug(
+                    "[BT] MATCH (underlying+otype) for %s: pos_id=%s ts=%s",
+                    signal.display_name, position["id"], position["trading_symbol"],
+                )
+                return position
+
+        # 4. Broadest: match on underlying only
+        positions = await self._db.find_all_open_positions_for_underlying(sig_underlying)
+        if positions:
+            logger.debug(
+                "[BT] MATCH (underlying only) for %s: pos_id=%s ts=%s",
+                signal.display_name, positions[0]["id"], positions[0]["trading_symbol"],
+            )
+            return positions[0]
+
+        # No match found — log all open positions for debugging
+        all_open = await self._db.get_all_positions(status="OPEN")
+        if all_open:
+            open_underlyings = [
+                f"{p['underlying']}({p['trading_symbol']})" for p in all_open
+            ]
+            logger.warning(
+                "[BT] NO MATCH for %s (underlying=%r strike=%s otype=%s day=%s month=%s). "
+                "Open positions: %s",
+                signal.display_name, sig_underlying, sig_strike, sig_otype,
+                sig_day, sig_month, ", ".join(open_underlyings),
+            )
+        else:
+            logger.warning(
+                "[BT] NO MATCH for %s — no open positions at all",
+                signal.display_name,
+            )
+        return None
 
     async def _resolve_exit_price(
         self, position: dict, msg_time: datetime
@@ -486,8 +584,10 @@ class BacktestEngine:
     async def _close_orphaned_positions(self) -> None:
         """Force-close any positions that were never explicitly exited.
 
-        Uses stoploss price if available (worst-case scenario), otherwise
-        entry price (break-even).
+        Priority for exit price:
+        1. Stoploss (worst-case scenario)
+        2. First target (optimistic estimate if no stoploss)
+        3. Entry price (break-even, last resort)
         """
         open_positions = await self._db.get_all_positions(status="OPEN")
         if not open_positions:
@@ -501,18 +601,36 @@ class BacktestEngine:
         for pos in open_positions:
             entry = pos["avg_entry_price"]
             stoploss = pos.get("stoploss")
+            source = "entry (break-even)"
 
             if stoploss is not None and stoploss > 0:
                 # Assume worst case — hit stoploss
                 exit_price = stoploss
+                source = "stoploss"
             else:
-                # No stoploss info — assume break-even
-                exit_price = entry
+                # Try first target as a better estimate than entry price
+                targets_raw = pos.get("targets")
+                target_price = None
+                if targets_raw:
+                    try:
+                        targets = json.loads(targets_raw) if isinstance(targets_raw, str) else targets_raw
+                        if targets and len(targets) > 0:
+                            target_price = float(targets[0])
+                    except (json.JSONDecodeError, TypeError, IndexError):
+                        pass
+
+                if target_price is not None:
+                    exit_price = target_price
+                    source = "first target"
+                    self._exit_from_target += 1
+                else:
+                    exit_price = entry
+                    self._exit_from_entry_fallback += 1
 
             pnl = (exit_price - entry) * pos["quantity"]
             await self._db.close_position(pos["id"], pnl=pnl)
 
             logger.info(
-                "[BT] FORCE-CLOSE %s  entry=₹%.2f  exit=₹%.2f (SL)  P&L=₹%.2f",
-                pos["trading_symbol"], entry, exit_price, pnl,
+                "[BT] FORCE-CLOSE %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
+                pos["trading_symbol"], entry, exit_price, source, pnl,
             )

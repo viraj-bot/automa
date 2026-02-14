@@ -58,6 +58,18 @@ _MONTHS = {
 
 _MONTH_PATTERN = "|".join(_MONTHS.keys())
 
+# ── Words that must NOT be captured as the underlying symbol ──
+# These are action/filler keywords that precede the real instrument name.
+_ACTION_WORDS = (
+    "BUY", "SELL", "SHORT", "LONG", "EXIT", "EXITED", "CLOSE", "CLOSED",
+    "BOOK", "BOOKED", "PROFIT", "TAKE", "TRAIL", "TRAILING", "PARTIAL",
+    "NEW", "FRESH", "ENTER", "ENTRY", "INITIATE", "ADD",
+    "PLEASE", "FROM", "IN", "ON", "AT", "THE", "OF", "FOR",
+    "OPTION", "TRADE", "OPTION TRADE",
+    "GO", "GET", "OUT", "SQUARE", "SQUARED",
+)
+_ACTION_WORDS_SET = frozenset(_ACTION_WORDS)
+
 # ── Instrument pattern (shared across signal types) ──
 # Matches: NIFTY50 17 FEB 25600 PE  or  INDHOTEL 24 FEB 690 CE
 #          BANK NIFTY 17 FEB 25600 PE  (two-word underlyings)
@@ -65,6 +77,11 @@ _MONTH_PATTERN = "|".join(_MONTHS.keys())
 # The underlying group allows an optional second word so that
 # "BANK NIFTY", "FIN NIFTY" etc. are captured as a single group
 # and later normalised via _normalize_underlying().
+#
+# IMPORTANT: A raw regex alone cannot exclude action keywords from the
+# underlying group reliably (negative lookahead for variable-length
+# alternations is fragile).  Instead, we use a broad regex and post-filter
+# the captured underlying in _clean_underlying().
 _INSTRUMENT_RE = re.compile(
     r"(?P<underlying>[A-Z][A-Z0-9]{1,20}(?:\s+[A-Z][A-Z0-9]{1,20})?)\s+"
     r"(?P<day>\d{1,2})\s+"
@@ -73,6 +90,38 @@ _INSTRUMENT_RE = re.compile(
     r"(?P<otype>CE|PE)",
     re.IGNORECASE,
 )
+
+
+def _clean_underlying(raw_match: str, full_text: str, match_start: int) -> str:
+    """Strip leading action keywords from a captured underlying group.
+
+    The instrument regex may capture "BUY NIFTY50" or "EXIT INDHOTEL" as the
+    underlying because the two-word pattern is greedy.  This function peels
+    off the first word if it is a known action keyword, leaving just the real
+    instrument name (e.g. "NIFTY50", "INDHOTEL", "BANK NIFTY").
+
+    It also looks *backwards* in the text for an additional preceding word
+    that might be part of a two-word underlying (e.g. if the regex only
+    captured "NIFTY" but "BANK" precedes it).
+    """
+    parts = raw_match.strip().split()
+
+    # If the first word is an action keyword, drop it
+    while len(parts) > 1 and parts[0].upper() in _ACTION_WORDS_SET:
+        parts = parts[1:]
+
+    # If we're left with a single word, check if the word before the match
+    # in the original text forms a two-word underlying (e.g. "BANK" before "NIFTY")
+    if len(parts) == 1:
+        prefix_text = full_text[:match_start].rstrip()
+        if prefix_text:
+            last_word = prefix_text.split()[-1].upper()
+            combined = f"{last_word} {parts[0].upper()}"
+            from parser.models import UNDERLYING_ALIASES
+            if combined in UNDERLYING_ALIASES:
+                return combined
+
+    return " ".join(parts)
 
 # ── Price extraction helpers ──
 _RUPEE_PRICE_RE = re.compile(
@@ -242,7 +291,7 @@ class SignalParser:
             logger.debug("ENTRY keyword found but no instrument match: %s", cleaned[:80])
             return None
 
-        underlying_raw = m.group("underlying").strip()
+        underlying_raw = _clean_underlying(m.group("underlying"), cleaned, m.start())
         underlying = _normalize_underlying(underlying_raw)
         day = int(m.group("day"))
         month = _normalise_month(m.group("month"))
@@ -302,7 +351,9 @@ class SignalParser:
         # Even without full instrument details, try to extract just the underlying
         # e.g. "Please exit from NIFTY50 17 FEB"
         if m:
-            underlying = _normalize_underlying(m.group("underlying").strip())
+            underlying = _normalize_underlying(
+                _clean_underlying(m.group("underlying"), cleaned, m.start())
+            )
             return ExitSignal(
                 underlying=underlying,
                 expiry_day=int(m.group("day")),
@@ -323,7 +374,9 @@ class SignalParser:
             re.IGNORECASE,
         )
         if partial:
-            underlying = _normalize_underlying(partial.group("underlying").strip())
+            underlying = _normalize_underlying(
+                _clean_underlying(partial.group("underlying"), cleaned, partial.start("underlying"))
+            )
             day = int(partial.group("day")) if partial.group("day") else None
             month = _normalise_month(partial.group("month")) if partial.group("month") else None
             return ExitSignal(
@@ -355,7 +408,9 @@ class SignalParser:
             exit_price = _extract_price_after(cleaned, "@")
 
         if m:
-            underlying = _normalize_underlying(m.group("underlying").strip())
+            underlying = _normalize_underlying(
+                _clean_underlying(m.group("underlying"), cleaned, m.start())
+            )
             return BookProfitSignal(
                 underlying=underlying,
                 expiry_day=int(m.group("day")),
@@ -377,7 +432,9 @@ class SignalParser:
             re.IGNORECASE,
         )
         if partial:
-            underlying = _normalize_underlying(partial.group("underlying").strip())
+            underlying = _normalize_underlying(
+                _clean_underlying(partial.group("underlying"), cleaned, partial.start("underlying"))
+            )
             day = int(partial.group("day")) if partial.group("day") else None
             month = _normalise_month(partial.group("month")) if partial.group("month") else None
             return BookProfitSignal(
