@@ -95,6 +95,10 @@ class BacktestEngine:
         exit_count = 0
         bp_count = 0
         errors = 0
+        entries_with_targets = 0
+        entries_without_targets = 0
+        bp_with_price = 0
+        bp_without_price = 0
 
         unparsed_count = 0
         for msg in messages:
@@ -124,10 +128,24 @@ class BacktestEngine:
                 await self._process_signal(signal, signal_id, msg["date"])
                 if isinstance(signal, EntrySignal):
                     entry_count += 1
+                    if signal.targets:
+                        entries_with_targets += 1
+                    else:
+                        entries_without_targets += 1
+                        logger.info(
+                            "[BT] ENTRY without targets: %s (price=₹%.2f, SL=%s) | %s",
+                            signal.display_name, signal.entry_price,
+                            signal.stoploss,
+                            signal.raw_text.replace("\n", " ")[:120],
+                        )
                 elif isinstance(signal, ExitSignal):
                     exit_count += 1
                 elif isinstance(signal, BookProfitSignal):
                     bp_count += 1
+                    if signal.exit_price is not None:
+                        bp_with_price += 1
+                    else:
+                        bp_without_price += 1
             except Exception:
                 logger.exception("Error processing signal")
                 errors += 1
@@ -171,6 +189,12 @@ class BacktestEngine:
         summary["exit_from_target"] = self._exit_from_target
         summary["exit_from_entry_fallback"] = self._exit_from_entry_fallback
         summary["unmatched_close_signals"] = self._unmatched_close_signals
+
+        # Entry quality breakdown
+        summary["entries_with_targets"] = entries_with_targets
+        summary["entries_without_targets"] = entries_without_targets
+        summary["bp_with_price"] = bp_with_price
+        summary["bp_without_price"] = bp_without_price
 
         await bt_db.close()
         return summary
@@ -534,7 +558,8 @@ class BacktestEngine:
         Priority:
         1. Groww historical candle price at the exit time
         2. First target from the entry signal (if available)
-        3. Entry price (break-even, last resort)
+        3. Stoploss (worst-case realistic exit)
+        4. Entry price (break-even, absolute last resort)
         """
         ts = position.get("trading_symbol", "?")
 
@@ -572,11 +597,22 @@ class BacktestEngine:
             except (json.JSONDecodeError, TypeError, IndexError):
                 pass
 
+        # Try stoploss as a worst-case realistic exit
+        stoploss = position.get("stoploss")
+        if stoploss is not None and stoploss > 0:
+            self._exit_from_entry_fallback += 1
+            logger.info(
+                "[BT] Exit price for %s: using stoploss ₹%.2f "
+                "(no historical data, no targets)",
+                ts, float(stoploss),
+            )
+            return float(stoploss)
+
         # Last resort: break-even at entry price
         self._exit_from_entry_fallback += 1
         logger.warning(
             "[BT] Exit price for %s: falling back to entry price ₹%.2f "
-            "(no historical data, no targets)",
+            "(no historical data, no targets, no stoploss)",
             ts, float(position["avg_entry_price"]),
         )
         return float(position["avg_entry_price"])

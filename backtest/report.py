@@ -28,9 +28,20 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     entries = summary.get("entries", 0)
     exits = summary.get("exits", 0)
     bps = summary.get("book_profits", 0)
+    entries_w = summary.get("entries_with_targets", 0)
+    entries_wo = summary.get("entries_without_targets", 0)
+    bp_w = summary.get("bp_with_price", 0)
+    bp_wo = summary.get("bp_without_price", 0)
+
     overview.add_row("  Entry signals", f"[green]{entries}[/green]")
+    if entries_w or entries_wo:
+        overview.add_row("    with targets", f"[green]{entries_w}[/green]")
+        overview.add_row("    without targets", f"[dim]{entries_wo}[/dim]")
     overview.add_row("  Exit signals", f"[yellow]{exits}[/yellow]")
     overview.add_row("  Book profit signals", f"[cyan]{bps}[/cyan]")
+    if bp_w or bp_wo:
+        overview.add_row("    with exit price", f"[green]{bp_w}[/green]")
+        overview.add_row("    without exit price", f"[dim]{bp_wo}[/dim]")
 
     unparsed = summary.get("unparsed_messages", 0)
     if unparsed:
@@ -106,7 +117,7 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
             )
         if exit_fallback:
             diag.add_row(
-                "Exits at entry price (fallback, no data)",
+                "Exits at SL/entry price (fallback, no data)",
                 f"[red]{exit_fallback}[/red]",
             )
         if unmatched:
