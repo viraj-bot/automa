@@ -21,6 +21,16 @@ class ProductType(str, enum.Enum):
     MIS = "MIS"
 
 
+class OrderPlacement(str, enum.Enum):
+    """How to place entry/exit orders.
+
+    LIMIT  – place at the signal price (may not fill if price moves away)
+    MARKET – place at market price (guaranteed fill, but price may differ)
+    """
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
+
+
 class Settings(BaseSettings):
     """All configuration is read from environment variables or a .env file."""
 
@@ -62,6 +72,14 @@ class Settings(BaseSettings):
     default_product: ProductType = Field(
         default=ProductType.NRML,
         description="Default product type for orders",
+    )
+    entry_order_type: OrderPlacement = Field(
+        default=OrderPlacement.MARKET,
+        description="Order type for entries: LIMIT (signal price) or MARKET (current price)",
+    )
+    exit_order_type: OrderPlacement = Field(
+        default=OrderPlacement.MARKET,
+        description="Order type for exits: LIMIT (signal price) or MARKET (current price)",
     )
 
     # ── Database ──

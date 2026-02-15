@@ -160,20 +160,21 @@ class PaperBroker(BrokerInterface):
                 return
 
         order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
+        entry_order_type = self._settings.entry_order_type.value
 
         order_id = await self._db.insert_order(
             signal_id=signal_id,
             trading_symbol=instrument["trading_symbol"],
             groww_symbol=instrument["groww_symbol"],
             transaction_type="BUY",
-            order_type="LIMIT",
+            order_type=entry_order_type,
             quantity=quantity,
             price=signal.entry_price,
             order_ref=order_ref,
             is_paper=True,
         )
 
-        # Immediately "fill" the paper order
+        # Paper mode: immediately "fill" at the signal price
         await self._db.update_order_status(
             order_id=order_id,
             status="EXECUTED",
@@ -231,14 +232,20 @@ class PaperBroker(BrokerInterface):
             position = positions[0]  # close the most recent
 
         order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
-        exit_price = position["avg_entry_price"]  # paper: exit at entry (conservative)
+
+        # Use the explicit exit price from the signal when available,
+        # otherwise fall back to entry price (conservative).
+        if signal.exit_price is not None:
+            exit_price = signal.exit_price
+        else:
+            exit_price = position["avg_entry_price"]
 
         order_id = await self._db.insert_order(
             signal_id=signal_id,
             trading_symbol=position["trading_symbol"],
             groww_symbol=position.get("groww_symbol"),
             transaction_type="SELL",
-            order_type="MARKET",
+            order_type="LIMIT" if signal.exit_price is not None else "MARKET",
             quantity=position["quantity"],
             price=exit_price,
             order_ref=order_ref,
@@ -287,6 +294,36 @@ class PaperBroker(BrokerInterface):
             position = positions[0]
 
         exit_price = signal.exit_price or position["avg_entry_price"]
+        quantity = int(position["quantity"])
+        entry_price = float(position["avg_entry_price"])
+
+        # Determine how much to close.
+        # For partial book-profit with 1 lot, close the entire position
+        # (you can't split a single lot).
+        if signal.is_partial:
+            instrument = self.resolve_trading_symbol(
+                position["underlying"],
+                position.get("expiry_day") or 1,
+                position.get("expiry_month") or "JAN",
+                position.get("strike_price") or 0,
+                position.get("option_type") or "CE",
+            )
+            lot_size = instrument.get("lot_size", 1) if instrument else 1
+
+            if quantity <= lot_size:
+                # 1 lot — close everything
+                close_qty = quantity
+            else:
+                # Multiple lots — close ~50%, rounded to whole lots
+                close_qty = quantity // 2
+                if lot_size > 1 and close_qty >= lot_size:
+                    close_qty = (close_qty // lot_size) * lot_size
+                if close_qty <= 0:
+                    close_qty = quantity
+        else:
+            close_qty = quantity
+
+        remaining_qty = quantity - close_qty
         order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
 
         order_id = await self._db.insert_order(
@@ -295,7 +332,7 @@ class PaperBroker(BrokerInterface):
             groww_symbol=position.get("groww_symbol"),
             transaction_type="SELL",
             order_type="LIMIT",
-            quantity=position["quantity"],
+            quantity=close_qty,
             price=exit_price,
             order_ref=order_ref,
             is_paper=True,
@@ -304,17 +341,27 @@ class PaperBroker(BrokerInterface):
         await self._db.update_order_status(
             order_id=order_id,
             status="EXECUTED",
-            filled_qty=position["quantity"],
+            filled_qty=close_qty,
             avg_fill_price=exit_price,
         )
 
-        pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
-        await self._db.close_position(position["id"], pnl=pnl)
+        pnl = (exit_price - entry_price) * close_qty
 
-        logger.info(
-            "[PAPER] BOOK_PROFIT %s x%d @ ₹%.2f  P&L: ₹%.2f",
-            position["trading_symbol"],
-            position["quantity"],
-            exit_price,
-            pnl,
-        )
+        if remaining_qty > 0:
+            # Partial close: reduce position, keep it open
+            await self._db.partial_close_position(
+                position["id"],
+                close_qty=close_qty,
+                partial_pnl=pnl,
+            )
+            logger.info(
+                "[PAPER] PARTIAL_BP %s  closed %d/%d @ ₹%.2f  P&L: ₹%.2f  remaining: %d",
+                position["trading_symbol"], close_qty, quantity,
+                exit_price, pnl, remaining_qty,
+            )
+        else:
+            await self._db.close_position(position["id"], pnl=pnl)
+            logger.info(
+                "[PAPER] BOOK_PROFIT %s x%d @ ₹%.2f  P&L: ₹%.2f",
+                position["trading_symbol"], close_qty, exit_price, pnl,
+            )

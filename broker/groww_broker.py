@@ -194,36 +194,43 @@ class GrowwBroker(BrokerInterface):
                 return
 
         product = self._settings.default_product.value  # NRML or MIS
+        use_market = self._settings.entry_order_type.value == "MARKET"
 
         # Place the main BUY order
         loop = asyncio.get_running_loop()
+
+        order_kwargs: dict[str, Any] = {
+            "trading_symbol": instrument["trading_symbol"],
+            "quantity": quantity,
+            "validity": self.groww.VALIDITY_DAY,
+            "exchange": self.groww.EXCHANGE_NSE,
+            "segment": self.groww.SEGMENT_FNO,
+            "product": getattr(self.groww, f"PRODUCT_{product}"),
+            "transaction_type": self.groww.TRANSACTION_TYPE_BUY,
+        }
+
+        if use_market:
+            order_kwargs["order_type"] = self.groww.ORDER_TYPE_MARKET
+            order_type_str = "MARKET"
+        else:
+            order_kwargs["order_type"] = self.groww.ORDER_TYPE_LIMIT
+            order_kwargs["price"] = signal.entry_price
+            order_type_str = "LIMIT"
+
         order_params = {
             "trading_symbol": instrument["trading_symbol"],
             "quantity": quantity,
-            "validity": "DAY",
-            "exchange": "NSE",
-            "segment": "FNO",
-            "product": product,
-            "order_type": "LIMIT",
+            "order_type": order_type_str,
             "transaction_type": "BUY",
-            "price": signal.entry_price,
+            "price": signal.entry_price if not use_market else "MARKET",
+            "product": product,
         }
         logger.debug("[GROWW REQ] place_order BUY: %s", order_params)
 
         try:
             response = await loop.run_in_executor(
                 None,
-                lambda: self.groww.place_order(
-                    trading_symbol=instrument["trading_symbol"],
-                    quantity=quantity,
-                    validity=self.groww.VALIDITY_DAY,
-                    exchange=self.groww.EXCHANGE_NSE,
-                    segment=self.groww.SEGMENT_FNO,
-                    product=getattr(self.groww, f"PRODUCT_{product}"),
-                    order_type=self.groww.ORDER_TYPE_LIMIT,
-                    transaction_type=self.groww.TRANSACTION_TYPE_BUY,
-                    price=signal.entry_price,
-                ),
+                lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
             logger.exception("Failed to place BUY order for %s", signal.display_name)
@@ -238,7 +245,7 @@ class GrowwBroker(BrokerInterface):
             trading_symbol=instrument["trading_symbol"],
             groww_symbol=instrument["groww_symbol"],
             transaction_type="BUY",
-            order_type="LIMIT",
+            order_type=order_type_str,
             quantity=quantity,
             price=signal.entry_price,
             order_ref=groww_order_id,
@@ -354,13 +361,40 @@ class GrowwBroker(BrokerInterface):
             position = positions[0]
 
         product = self._settings.default_product.value
+        use_market = self._settings.exit_order_type.value == "MARKET"
         loop = asyncio.get_running_loop()
+
+        # Determine order type:
+        # - If user configured MARKET → always MARKET (guaranteed fill)
+        # - If user configured LIMIT  → use signal.exit_price when available,
+        #   otherwise fall back to MARKET (can't LIMIT without a price)
+        exit_price = signal.exit_price
+        if use_market or exit_price is None:
+            order_type_str = "MARKET"
+            order_type_const = self.groww.ORDER_TYPE_MARKET
+        else:
+            order_type_str = "LIMIT"
+            order_type_const = self.groww.ORDER_TYPE_LIMIT
+
+        order_kwargs: dict[str, Any] = {
+            "trading_symbol": position["trading_symbol"],
+            "quantity": position["quantity"],
+            "validity": self.groww.VALIDITY_DAY,
+            "exchange": self.groww.EXCHANGE_NSE,
+            "segment": self.groww.SEGMENT_FNO,
+            "product": getattr(self.groww, f"PRODUCT_{product}"),
+            "order_type": order_type_const,
+            "transaction_type": self.groww.TRANSACTION_TYPE_SELL,
+        }
+        if order_type_str == "LIMIT" and exit_price is not None:
+            order_kwargs["price"] = exit_price
 
         exit_params = {
             "trading_symbol": position["trading_symbol"],
             "quantity": position["quantity"],
-            "order_type": "MARKET",
+            "order_type": order_type_str,
             "transaction_type": "SELL",
+            "price": exit_price if order_type_str == "LIMIT" else "MARKET",
             "product": product,
         }
         logger.debug("[GROWW REQ] place_order EXIT: %s", exit_params)
@@ -368,16 +402,7 @@ class GrowwBroker(BrokerInterface):
         try:
             response = await loop.run_in_executor(
                 None,
-                lambda: self.groww.place_order(
-                    trading_symbol=position["trading_symbol"],
-                    quantity=position["quantity"],
-                    validity=self.groww.VALIDITY_DAY,
-                    exchange=self.groww.EXCHANGE_NSE,
-                    segment=self.groww.SEGMENT_FNO,
-                    product=getattr(self.groww, f"PRODUCT_{product}"),
-                    order_type=self.groww.ORDER_TYPE_MARKET,
-                    transaction_type=self.groww.TRANSACTION_TYPE_SELL,
-                ),
+                lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
             logger.exception("[LIVE] Failed to place EXIT order for %s", position["trading_symbol"])
@@ -391,8 +416,9 @@ class GrowwBroker(BrokerInterface):
             trading_symbol=position["trading_symbol"],
             groww_symbol=position.get("groww_symbol"),
             transaction_type="SELL",
-            order_type="MARKET",
+            order_type=order_type_str,
             quantity=position["quantity"],
+            price=exit_price,
             order_ref=groww_order_id,
             is_paper=False,
         )
@@ -402,14 +428,19 @@ class GrowwBroker(BrokerInterface):
             status=response.get("order_status", "OPEN"),
         )
 
-        # Mark position closed (P&L will be updated when fill is confirmed)
-        await self._db.close_position(position["id"], pnl=0)
+        # Estimate P&L from signal price (will be updated when fill is confirmed)
+        pnl = 0.0
+        if exit_price is not None:
+            pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
+        await self._db.close_position(position["id"], pnl=pnl)
 
         logger.info(
-            "[LIVE] EXIT %s x%d  order_id=%s",
+            "[LIVE] EXIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
             position["trading_symbol"],
             position["quantity"],
+            exit_price or "MARKET",
             groww_order_id,
+            pnl,
         )
 
     # ── Book Profit ──────────────────────────────────────────────────────
@@ -434,32 +465,66 @@ class GrowwBroker(BrokerInterface):
             position = positions[0]
 
         exit_price = signal.exit_price
+        quantity = int(position["quantity"])
+        entry_price = float(position["avg_entry_price"])
         product = self._settings.default_product.value
+        use_market = self._settings.exit_order_type.value == "MARKET"
         loop = asyncio.get_running_loop()
+
+        # Determine how much to close.
+        # For partial book-profit with 1 lot, close the entire position.
+        if signal.is_partial:
+            instrument = self.resolve_trading_symbol(
+                position["underlying"],
+                position.get("expiry_day") or 1,
+                position.get("expiry_month") or "JAN",
+                position.get("strike_price") or 0,
+                position.get("option_type") or "CE",
+            )
+            lot_size = instrument.get("lot_size", 1) if instrument else 1
+
+            if quantity <= lot_size:
+                close_qty = quantity
+            else:
+                close_qty = quantity // 2
+                if lot_size > 1 and close_qty >= lot_size:
+                    close_qty = (close_qty // lot_size) * lot_size
+                if close_qty <= 0:
+                    close_qty = quantity
+        else:
+            close_qty = quantity
+
+        remaining_qty = quantity - close_qty
+
+        # Determine order type for the book-profit exit
+        if use_market or exit_price is None:
+            order_type_str = "MARKET"
+            order_type_const = self.groww.ORDER_TYPE_MARKET
+        else:
+            order_type_str = "LIMIT"
+            order_type_const = self.groww.ORDER_TYPE_LIMIT
 
         order_kwargs: dict[str, Any] = {
             "trading_symbol": position["trading_symbol"],
-            "quantity": position["quantity"],
+            "quantity": close_qty,
             "validity": self.groww.VALIDITY_DAY,
             "exchange": self.groww.EXCHANGE_NSE,
             "segment": self.groww.SEGMENT_FNO,
             "product": getattr(self.groww, f"PRODUCT_{product}"),
             "transaction_type": self.groww.TRANSACTION_TYPE_SELL,
+            "order_type": order_type_const,
         }
-
-        if exit_price is not None:
-            order_kwargs["order_type"] = self.groww.ORDER_TYPE_LIMIT
+        if order_type_str == "LIMIT" and exit_price is not None:
             order_kwargs["price"] = exit_price
-        else:
-            order_kwargs["order_type"] = self.groww.ORDER_TYPE_MARKET
 
         bp_params = {
             "trading_symbol": position["trading_symbol"],
-            "quantity": position["quantity"],
-            "order_type": "LIMIT" if exit_price else "MARKET",
+            "quantity": close_qty,
+            "order_type": order_type_str,
             "transaction_type": "SELL",
-            "price": exit_price,
+            "price": exit_price if order_type_str == "LIMIT" else "MARKET",
             "product": product,
+            "partial": signal.is_partial,
         }
         logger.debug("[GROWW REQ] place_order BOOK_PROFIT: %s", bp_params)
 
@@ -483,8 +548,8 @@ class GrowwBroker(BrokerInterface):
             trading_symbol=position["trading_symbol"],
             groww_symbol=position.get("groww_symbol"),
             transaction_type="SELL",
-            order_type="LIMIT" if exit_price else "MARKET",
-            quantity=position["quantity"],
+            order_type=order_type_str,
+            quantity=close_qty,
             price=exit_price,
             order_ref=groww_order_id,
             is_paper=False,
@@ -497,15 +562,24 @@ class GrowwBroker(BrokerInterface):
 
         pnl = 0.0
         if exit_price is not None:
-            pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
+            pnl = (exit_price - entry_price) * close_qty
 
-        await self._db.close_position(position["id"], pnl=pnl)
-
-        logger.info(
-            "[LIVE] BOOK_PROFIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
-            position["trading_symbol"],
-            position["quantity"],
-            exit_price or "MARKET",
-            groww_order_id,
-            pnl,
-        )
+        if remaining_qty > 0:
+            # Partial close: reduce position, keep it open
+            await self._db.partial_close_position(
+                position["id"],
+                close_qty=close_qty,
+                partial_pnl=pnl,
+            )
+            logger.info(
+                "[LIVE] PARTIAL_BP %s  closed %d/%d @ ₹%s  order_id=%s  est_pnl=₹%.2f  remaining=%d",
+                position["trading_symbol"], close_qty, quantity,
+                exit_price or "MARKET", groww_order_id, pnl, remaining_qty,
+            )
+        else:
+            await self._db.close_position(position["id"], pnl=pnl)
+            logger.info(
+                "[LIVE] BOOK_PROFIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
+                position["trading_symbol"], close_qty,
+                exit_price or "MARKET", groww_order_id, pnl,
+            )

@@ -92,8 +92,8 @@ class Database:
             cursor = await self.conn.execute(
                 """INSERT INTO signals
                    (signal_hash, signal_type, underlying, expiry_day, expiry_month,
-                    strike_price, option_type, raw_text, telegram_msg_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    strike_price, option_type, exit_price, raw_text, telegram_msg_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     signal.signal_hash,
                     signal.signal_type.value,
@@ -102,6 +102,7 @@ class Database:
                     signal.expiry_month,
                     signal.strike_price,
                     signal.option_type.value if signal.option_type else None,
+                    signal.exit_price,
                     signal.raw_text,
                     signal.message_id,
                 ),
