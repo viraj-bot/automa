@@ -180,20 +180,32 @@ async def _run_live_or_paper(mode: str) -> None:
 
 
 async def _run_backtest(days: int, limit: int | None) -> None:
-    """Run the backtest engine and print the report."""
+    """Run the backtest engine, print the report, and optionally email it."""
     from config.settings import get_settings
     from backtest.engine import BacktestEngine
     from backtest.report import print_backtest_report
+    from notifications.daily_summary import send_backtest_summary_email
     from storage.db import Database
 
+    log = logging.getLogger(__name__)
     settings = get_settings()
     db = Database(settings.database_path)
     await db.connect()
 
     engine = BacktestEngine(settings, db)
     summary = await engine.run(days=days, limit=limit)
+    summary["days"] = days  # pass through for the email subject
 
     print_backtest_report(summary)
+
+    # Send email if configured
+    if settings.summary_email_to and settings.smtp_password:
+        log.info("Sending backtest summary email …")
+        await send_backtest_summary_email(settings, summary)
+    else:
+        log.info(
+            "Skipping backtest email — set SUMMARY_EMAIL_TO and SMTP_PASSWORD in .env to enable"
+        )
 
     await db.close()
 

@@ -328,6 +328,278 @@ def _build_html(
     return html
 
 
+# ── Backtest summary email ─────────────────────────────────────────────
+
+
+async def send_backtest_summary_email(
+    settings: Settings,
+    summary: dict[str, Any],
+) -> None:
+    """Build an HTML email from the backtest summary dict and send it."""
+    if not settings.summary_email_to:
+        logger.info("No SUMMARY_EMAIL_TO configured — skipping backtest email")
+        return
+    if not settings.smtp_user or not settings.smtp_password:
+        logger.warning("SMTP credentials not configured — skipping backtest email")
+        return
+
+    html = _build_backtest_html(summary)
+    total_pnl = summary.get("total_pnl", 0) or 0
+    total_trades = summary.get("total_trades", 0) or 0
+    days = summary.get("days", "?")
+    sign = "+" if total_pnl >= 0 else ""
+
+    if total_trades == 0:
+        subject = f"Automa Backtest Report — {days} days — No trades"
+    else:
+        subject = f"Automa Backtest Report — {days} days — {total_trades} trades — {sign}₹{total_pnl:,.2f}"
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _send_email,
+            settings.smtp_host,
+            settings.smtp_port,
+            settings.smtp_user,
+            settings.smtp_password,
+            settings.summary_email_to,
+            subject,
+            html,
+        )
+        logger.info("Backtest summary email sent to %s", settings.summary_email_to)
+    except Exception:
+        logger.exception("Failed to send backtest summary email")
+
+
+def _build_backtest_html(summary: dict[str, Any]) -> str:
+    """Build an HTML email from the backtest engine's summary dict."""
+    from datetime import datetime, timezone, timedelta
+    IST_tz = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(IST_tz)
+
+    total_pnl = summary.get("total_pnl", 0) or 0
+    wins = summary.get("wins", 0) or 0
+    losses = summary.get("losses", 0) or 0
+    breakeven = summary.get("breakeven", 0) or 0
+    total_trades = summary.get("total_trades", 0) or 0
+    best = summary.get("best_trade", 0) or 0
+    worst = summary.get("worst_trade", 0) or 0
+    avg_pnl = summary.get("avg_pnl", 0) or 0
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    days = summary.get("days", "?")
+
+    entries = summary.get("entries", 0) or 0
+    exits = summary.get("exits", 0) or 0
+    bps = summary.get("book_profits", 0) or 0
+    total_messages = summary.get("total_messages", 0) or 0
+    total_signals = summary.get("total_signals", 0) or 0
+    unparsed = summary.get("unparsed_messages", 0) or 0
+
+    trade_log = summary.get("trade_log", [])
+
+    # P&L display
+    if total_pnl > 0:
+        pnl_class = "pnl-positive"
+        pnl_display = f"+₹{total_pnl:,.2f}"
+    elif total_pnl < 0:
+        pnl_class = "pnl-negative"
+        pnl_display = f"-₹{abs(total_pnl):,.2f}"
+    else:
+        pnl_class = "pnl-zero"
+        pnl_display = "₹0.00"
+
+    # CSS (reuse same styles)
+    css = """
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #f8fafc; margin: 0; padding: 20px; color: #1e293b; }
+        .container { max-width: 720px; margin: 0 auto; background: #ffffff;
+                     border-radius: 12px; overflow: hidden;
+                     box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .header { background: linear-gradient(135deg, #7c3aed, #a855f7);
+                  color: white; padding: 24px 28px; }
+        .header h1 { margin: 0; font-size: 22px; font-weight: 600; }
+        .header p { margin: 6px 0 0; opacity: 0.85; font-size: 14px; }
+        .mode-badge { display: inline-block; background: rgba(255,255,255,0.2);
+                      padding: 2px 10px; border-radius: 12px; font-size: 11px;
+                      font-weight: 600; letter-spacing: 0.5px; margin-left: 8px; }
+        .content { padding: 24px 28px; }
+        .pnl-hero { text-align: center; padding: 20px 0; margin-bottom: 20px;
+                    border-bottom: 1px solid #e2e8f0; }
+        .pnl-hero .label { font-size: 13px; color: #64748b; text-transform: uppercase;
+                           letter-spacing: 1px; margin-bottom: 4px; }
+        .pnl-hero .amount { font-size: 36px; font-weight: 700; }
+        .pnl-positive { color: #16a34a; }
+        .pnl-negative { color: #dc2626; }
+        .pnl-zero { color: #6b7280; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+                      margin-bottom: 24px; }
+        .stat-card { background: #f8fafc; border-radius: 8px; padding: 14px;
+                     text-align: center; }
+        .stat-card .value { font-size: 22px; font-weight: 700; color: #1e293b; }
+        .stat-card .label { font-size: 11px; color: #64748b; text-transform: uppercase;
+                            letter-spacing: 0.5px; margin-top: 2px; }
+        h2 { font-size: 16px; font-weight: 600; color: #334155;
+             margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 2px solid #e2e8f0; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { background: #f1f5f9; color: #475569; font-weight: 600; text-align: left;
+             padding: 8px 10px; font-size: 11px; text-transform: uppercase;
+             letter-spacing: 0.5px; }
+        td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
+        tr:last-child td { border-bottom: none; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+        .footer { background: #f8fafc; padding: 16px 28px; text-align: center;
+                  font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0; }
+        .no-trades { text-align: center; padding: 30px; color: #94a3b8; font-size: 14px; }
+    </style>
+    """
+
+    # ── Trade log table ──
+    if trade_log:
+        trade_rows = ""
+        for t in trade_log:
+            pnl_val = t.get("pnl", 0) or 0
+            entry_time = t.get("entry_time", "—")
+            exit_time = t.get("exit_time", "—")
+            exit_src = t.get("exit_source", "—")
+            close_type = {
+                "BOOK_PROFIT": "BP",
+                "EXIT": "EXIT",
+                "ORPHAN": "ORPHAN",
+                "PARTIAL": "PARTIAL",
+            }.get(t.get("close_type", ""), t.get("close_type", "—"))
+
+            trade_rows += f"""
+            <tr>
+                <td class="text-center">{t.get('trade_no', '')}</td>
+                <td>{t.get('instrument', '—')}</td>
+                <td class="text-right">{t.get('qty', 0)}</td>
+                <td class="text-center" style="font-size:11px">{entry_time}</td>
+                <td class="text-right">₹{t.get('entry_price', 0):,.2f}</td>
+                <td class="text-center" style="font-size:11px">{exit_time}</td>
+                <td class="text-right">₹{t.get('exit_price', 0):,.2f}</td>
+                <td class="text-center">{exit_src}</td>
+                <td class="text-center">{close_type}</td>
+                <td class="text-right">{_fmt_pnl(pnl_val)}</td>
+            </tr>"""
+
+        trades_section = f"""
+        <h2>Trade Log ({len(trade_log)} trades)</h2>
+        <div style="overflow-x:auto">
+        <table>
+            <tr>
+                <th class="text-center">#</th>
+                <th>Instrument</th>
+                <th class="text-right">Qty</th>
+                <th class="text-center">Entry Date</th>
+                <th class="text-right">Entry ₹</th>
+                <th class="text-center">Exit Date</th>
+                <th class="text-right">Exit ₹</th>
+                <th class="text-center">Source</th>
+                <th class="text-center">Type</th>
+                <th class="text-right">P&L</th>
+            </tr>
+            {trade_rows}
+        </table>
+        </div>"""
+    else:
+        trades_section = '<div class="no-trades">No closed trades in this backtest</div>'
+
+    # ── Price sources ──
+    entry_groww = summary.get("entry_from_groww", 0) or 0
+    entry_signal = summary.get("entry_from_signal", 0) or 0
+    exit_groww = summary.get("exit_from_groww", 0) or 0
+    exit_signal = summary.get("exit_from_signal", 0) or 0
+    exit_target = summary.get("exit_from_target", 0) or 0
+    exit_stoploss = summary.get("exit_from_stoploss", 0) or 0
+    exit_entry = summary.get("exit_from_entry", 0) or 0
+    unmatched = summary.get("unmatched_close_signals", 0) or 0
+
+    price_section = f"""
+    <h2>Price Sources</h2>
+    <table>
+        <tr><td>Entries at Groww market price</td><td class="text-right">{entry_groww}</td></tr>
+        <tr><td>Entries at signal price</td><td class="text-right">{entry_signal}</td></tr>
+        <tr><td>Exits at Groww market price</td><td class="text-right">{exit_groww}</td></tr>
+        <tr><td>Exits at signal price (book profit)</td><td class="text-right">{exit_signal}</td></tr>
+        <tr><td>Exits at target (estimated)</td><td class="text-right">{exit_target}</td></tr>
+        <tr><td>Exits at stoploss</td><td class="text-right">{exit_stoploss}</td></tr>
+        {"<tr><td>Exits at entry (no data)</td><td class='text-right'>" + str(exit_entry) + "</td></tr>" if exit_entry else ""}
+        {"<tr><td>Unmatched close signals</td><td class='text-right'>" + str(unmatched) + "</td></tr>" if unmatched else ""}
+    </table>"""
+
+    # ── Overview ──
+    overview_section = f"""
+    <h2>Overview</h2>
+    <table>
+        <tr><td>Messages analysed</td><td class="text-right"><b>{total_messages}</b></td></tr>
+        <tr><td>Signals parsed</td><td class="text-right">{total_signals}</td></tr>
+        <tr><td>&nbsp;&nbsp;Entry signals</td><td class="text-right">{entries}</td></tr>
+        <tr><td>&nbsp;&nbsp;Exit signals</td><td class="text-right">{exits}</td></tr>
+        <tr><td>&nbsp;&nbsp;Book profit signals</td><td class="text-right">{bps}</td></tr>
+        {"<tr><td>&nbsp;&nbsp;Unparsed messages</td><td class='text-right'>" + str(unparsed) + "</td></tr>" if unparsed else ""}
+    </table>"""
+
+    # ── Assemble ──
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+{css}
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>Automa Backtest Report <span class="mode-badge">BACKTEST</span></h1>
+        <p>Last {days} days &mdash; {total_messages} messages analysed</p>
+    </div>
+    <div class="content">
+        <div class="pnl-hero">
+            <div class="label">Total P&L</div>
+            <div class="amount {pnl_class}">{pnl_display}</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="value">{total_trades}</div>
+                <div class="label">Trades</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" style="color:#16a34a">{wins}</div>
+                <div class="label">Wins</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" style="color:#dc2626">{losses}</div>
+                <div class="label">Losses</div>
+            </div>
+            <div class="stat-card">
+                <div class="value">{win_rate:.1f}%</div>
+                <div class="label">Win Rate</div>
+            </div>
+        </div>
+
+        <table style="margin-bottom:20px">
+            <tr><td>Avg P&L per trade</td><td class="text-right">{_fmt_pnl(avg_pnl)}</td></tr>
+            <tr><td>Best trade</td><td class="text-right">{_fmt_pnl(best)}</td></tr>
+            <tr><td>Worst trade</td><td class="text-right">{_fmt_pnl(worst)}</td></tr>
+            {"<tr><td>Break-even trades</td><td class='text-right'>" + str(breakeven) + "</td></tr>" if breakeven else ""}
+        </table>
+
+        {trades_section}
+        {price_section}
+        {overview_section}
+    </div>
+    <div class="footer">
+        Generated by Automa at {now_ist.strftime('%I:%M %p IST on %d %b %Y')}
+    </div>
+</div>
+</body>
+</html>"""
+
+    return html
+
+
 def _send_email(
     smtp_host: str,
     smtp_port: int,
