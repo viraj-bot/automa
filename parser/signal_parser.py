@@ -326,8 +326,27 @@ class SignalParser:
     ) -> Optional[TradeSignal]:
         """Attempt to parse *text* into a trade signal.
 
-        Returns ``None`` if the message is not recognised as a trade signal.
+        Returns ``None`` if the message is not recognised as a trade signal
+        **or** if an unexpected error occurs during parsing (logged and
+        swallowed so the caller never crashes).
         """
+        try:
+            return self._parse_inner(text, message_id, timestamp)
+        except Exception:
+            preview = (text or "").replace("\n", " ").strip()[:120]
+            logger.exception(
+                "Parser error on msg_id=%s — treating as unparsed: %s",
+                message_id, preview,
+            )
+            return None
+
+    def _parse_inner(
+        self,
+        text: str,
+        message_id: Optional[int],
+        timestamp: Optional[datetime],
+    ) -> Optional[TradeSignal]:
+        """Core parsing logic (may raise on malformed input)."""
         if not text or len(text) < 5:
             return None
 

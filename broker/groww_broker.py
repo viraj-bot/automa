@@ -169,6 +169,12 @@ class GrowwBroker(BrokerInterface):
     # ── Entry ────────────────────────────────────────────────────────────
 
     async def execute_entry(self, signal: EntrySignal, signal_id: int) -> None:
+        try:
+            await self._execute_entry_inner(signal, signal_id)
+        except Exception:
+            logger.exception("[LIVE] Unhandled error in execute_entry for %s", signal.display_name)
+
+    async def _execute_entry_inner(self, signal: EntrySignal, signal_id: int) -> None:
         instrument = self.resolve_trading_symbol(
             signal.underlying,
             signal.expiry_day,
@@ -240,49 +246,57 @@ class GrowwBroker(BrokerInterface):
         groww_order_id = response.get("groww_order_id", "")
         order_status = response.get("order_status", "UNKNOWN")
 
-        order_id = await self._db.insert_order(
-            signal_id=signal_id,
-            trading_symbol=instrument["trading_symbol"],
-            groww_symbol=instrument["groww_symbol"],
-            transaction_type="BUY",
-            order_type=order_type_str,
-            quantity=quantity,
-            price=signal.entry_price,
-            order_ref=groww_order_id,
-            is_paper=False,
-            exchange=instrument.get("exchange", "NSE"),
-            segment=instrument.get("segment", "FNO"),
-            product=product,
-        )
-
-        await self._db.update_order_status(
-            order_id=order_id,
-            status=order_status,
-            filled_qty=0,
-        )
-
-        # Open position record (will be confirmed via feed updates)
-        await self._db.open_position(
-            signal_id=signal_id,
-            underlying=signal.underlying,
-            trading_symbol=instrument["trading_symbol"],
-            groww_symbol=instrument["groww_symbol"],
-            quantity=quantity,
-            avg_entry_price=signal.entry_price,
-            option_type=signal.option_type.value,
-            strike_price=signal.strike_price,
-            expiry_day=signal.expiry_day,
-            expiry_month=signal.expiry_month,
-            stoploss=signal.stoploss,
-            targets=signal.targets,
-            is_paper=False,
-        )
-
         logger.info(
             "[LIVE] BUY %s x%d @ ₹%.2f  order_id=%s status=%s",
             signal.display_name, quantity, signal.entry_price,
             groww_order_id, order_status,
         )
+
+        # Record in DB — if this fails, the order is live on Groww but
+        # unrecorded locally.  Log critically but don't crash.
+        try:
+            order_id = await self._db.insert_order(
+                signal_id=signal_id,
+                trading_symbol=instrument["trading_symbol"],
+                groww_symbol=instrument["groww_symbol"],
+                transaction_type="BUY",
+                order_type=order_type_str,
+                quantity=quantity,
+                price=signal.entry_price,
+                order_ref=groww_order_id,
+                is_paper=False,
+                exchange=instrument.get("exchange", "NSE"),
+                segment=instrument.get("segment", "FNO"),
+                product=product,
+            )
+
+            await self._db.update_order_status(
+                order_id=order_id,
+                status=order_status,
+                filled_qty=0,
+            )
+
+            await self._db.open_position(
+                signal_id=signal_id,
+                underlying=signal.underlying,
+                trading_symbol=instrument["trading_symbol"],
+                groww_symbol=instrument["groww_symbol"],
+                quantity=quantity,
+                avg_entry_price=signal.entry_price,
+                option_type=signal.option_type.value,
+                strike_price=signal.strike_price,
+                expiry_day=signal.expiry_day,
+                expiry_month=signal.expiry_month,
+                stoploss=signal.stoploss,
+                targets=signal.targets,
+                is_paper=False,
+            )
+        except Exception:
+            logger.exception(
+                "CRITICAL: BUY order %s placed on Groww but DB recording failed! "
+                "Manual reconciliation needed.",
+                groww_order_id,
+            )
 
         # Place SL order if stoploss is provided
         if signal.stoploss is not None:
@@ -344,6 +358,12 @@ class GrowwBroker(BrokerInterface):
     # ── Exit ─────────────────────────────────────────────────────────────
 
     async def execute_exit(self, signal: ExitSignal, signal_id: int) -> None:
+        try:
+            await self._execute_exit_inner(signal, signal_id)
+        except Exception:
+            logger.exception("[LIVE] Unhandled error in execute_exit for %s", signal.display_name)
+
+    async def _execute_exit_inner(self, signal: ExitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
             underlying=signal.underlying,
             strike_price=signal.strike_price,
@@ -411,28 +431,9 @@ class GrowwBroker(BrokerInterface):
         logger.debug("[GROWW RES] place_order EXIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
 
-        order_id = await self._db.insert_order(
-            signal_id=signal_id,
-            trading_symbol=position["trading_symbol"],
-            groww_symbol=position.get("groww_symbol"),
-            transaction_type="SELL",
-            order_type=order_type_str,
-            quantity=position["quantity"],
-            price=exit_price,
-            order_ref=groww_order_id,
-            is_paper=False,
-        )
-
-        await self._db.update_order_status(
-            order_id=order_id,
-            status=response.get("order_status", "OPEN"),
-        )
-
-        # Estimate P&L from signal price (will be updated when fill is confirmed)
         pnl = 0.0
         if exit_price is not None:
             pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
-        await self._db.close_position(position["id"], pnl=pnl)
 
         logger.info(
             "[LIVE] EXIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
@@ -443,9 +444,41 @@ class GrowwBroker(BrokerInterface):
             pnl,
         )
 
+        try:
+            order_id = await self._db.insert_order(
+                signal_id=signal_id,
+                trading_symbol=position["trading_symbol"],
+                groww_symbol=position.get("groww_symbol"),
+                transaction_type="SELL",
+                order_type=order_type_str,
+                quantity=position["quantity"],
+                price=exit_price,
+                order_ref=groww_order_id,
+                is_paper=False,
+            )
+
+            await self._db.update_order_status(
+                order_id=order_id,
+                status=response.get("order_status", "OPEN"),
+            )
+
+            await self._db.close_position(position["id"], pnl=pnl)
+        except Exception:
+            logger.exception(
+                "CRITICAL: EXIT order %s placed on Groww but DB recording failed! "
+                "Manual reconciliation needed.",
+                groww_order_id,
+            )
+
     # ── Book Profit ──────────────────────────────────────────────────────
 
     async def execute_book_profit(self, signal: BookProfitSignal, signal_id: int) -> None:
+        try:
+            await self._execute_book_profit_inner(signal, signal_id)
+        except Exception:
+            logger.exception("[LIVE] Unhandled error in execute_book_profit for %s", signal.display_name)
+
+    async def _execute_book_profit_inner(self, signal: BookProfitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
             underlying=signal.underlying,
             strike_price=signal.strike_price,
@@ -543,41 +576,50 @@ class GrowwBroker(BrokerInterface):
         logger.debug("[GROWW RES] place_order BOOK_PROFIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
 
-        order_id = await self._db.insert_order(
-            signal_id=signal_id,
-            trading_symbol=position["trading_symbol"],
-            groww_symbol=position.get("groww_symbol"),
-            transaction_type="SELL",
-            order_type=order_type_str,
-            quantity=close_qty,
-            price=exit_price,
-            order_ref=groww_order_id,
-            is_paper=False,
-        )
-
-        await self._db.update_order_status(
-            order_id=order_id,
-            status=response.get("order_status", "OPEN"),
-        )
-
         pnl = 0.0
         if exit_price is not None:
             pnl = (exit_price - entry_price) * close_qty
 
-        if remaining_qty > 0:
-            # Partial close: reduce position, keep it open
-            await self._db.partial_close_position(
-                position["id"],
-                close_qty=close_qty,
-                partial_pnl=pnl,
+        try:
+            order_id = await self._db.insert_order(
+                signal_id=signal_id,
+                trading_symbol=position["trading_symbol"],
+                groww_symbol=position.get("groww_symbol"),
+                transaction_type="SELL",
+                order_type=order_type_str,
+                quantity=close_qty,
+                price=exit_price,
+                order_ref=groww_order_id,
+                is_paper=False,
             )
+
+            await self._db.update_order_status(
+                order_id=order_id,
+                status=response.get("order_status", "OPEN"),
+            )
+
+            if remaining_qty > 0:
+                await self._db.partial_close_position(
+                    position["id"],
+                    close_qty=close_qty,
+                    partial_pnl=pnl,
+                )
+            else:
+                await self._db.close_position(position["id"], pnl=pnl)
+        except Exception:
+            logger.exception(
+                "CRITICAL: BOOK_PROFIT order %s placed on Groww but DB recording "
+                "failed! Manual reconciliation needed.",
+                groww_order_id,
+            )
+
+        if remaining_qty > 0:
             logger.info(
                 "[LIVE] PARTIAL_BP %s  closed %d/%d @ ₹%s  order_id=%s  est_pnl=₹%.2f  remaining=%d",
                 position["trading_symbol"], close_qty, quantity,
                 exit_price or "MARKET", groww_order_id, pnl, remaining_qty,
             )
         else:
-            await self._db.close_position(position["id"], pnl=pnl)
             logger.info(
                 "[LIVE] BOOK_PROFIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
                 position["trading_symbol"], close_qty,

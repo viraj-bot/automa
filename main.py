@@ -53,7 +53,12 @@ def _setup_logging(level: str) -> None:
 
 
 async def _run_live_or_paper(mode: str) -> None:
-    """Start the Telegram listener with either the live or paper broker."""
+    """Start the Telegram listener with either the live or paper broker.
+
+    Includes automatic reconnection with exponential backoff so that
+    transient network failures or Telegram disconnects do not kill the
+    long-running daemon.
+    """
     from config.settings import AppMode, get_settings
     from broker.paper_broker import PaperBroker
     from broker.groww_broker import GrowwBroker
@@ -61,8 +66,8 @@ async def _run_live_or_paper(mode: str) -> None:
     from storage.db import Database
     from telegram.listener import TelegramListener
 
+    log = logging.getLogger(__name__)
     settings = get_settings()
-    # Override mode if passed via CLI
     settings_mode = AppMode(mode)
 
     db = Database(settings.database_path)
@@ -77,40 +82,88 @@ async def _run_live_or_paper(mode: str) -> None:
 
     await broker.initialize()
 
-    listener = TelegramListener(
-        settings=settings,
-        parser=parser,
-        broker=broker,
-        db=db,
-    )
-
     # Graceful shutdown on SIGINT / SIGTERM
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
 
     def _handle_signal() -> None:
-        logging.getLogger(__name__).info("Shutdown signal received …")
+        log.info("Shutdown signal received …")
         shutdown_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    await listener.start()
+    # ── Reconnection loop ──
+    max_backoff = 300  # 5 minutes
+    backoff = 5        # start at 5 seconds
 
-    # Run until shutdown
-    listener_task = asyncio.create_task(listener.run_forever())
-    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    while not shutdown_event.is_set():
+        listener = TelegramListener(
+            settings=settings,
+            parser=parser,
+            broker=broker,
+            db=db,
+        )
 
-    done, pending = await asyncio.wait(
-        {listener_task, shutdown_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+        try:
+            await listener.start()
+            backoff = 5  # reset on successful connect
 
-    # Cleanup
-    for task in pending:
-        task.cancel()
+            listener_task = asyncio.create_task(listener.run_forever())
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
 
-    await listener.stop()
+            done, pending = await asyncio.wait(
+                {listener_task, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Check if listener died with an error
+            for task in done:
+                if task is listener_task and task.exception() is not None:
+                    raise task.exception()
+
+            # If shutdown was requested, break out
+            if shutdown_event.is_set():
+                for task in pending:
+                    task.cancel()
+                break
+
+            # Listener finished without shutdown — treat as disconnect
+            for task in pending:
+                task.cancel()
+
+        except Exception:
+            if shutdown_event.is_set():
+                break
+            log.exception(
+                "Telegram connection lost — reconnecting in %d seconds …",
+                backoff,
+            )
+
+        # Stop the current listener gracefully
+        try:
+            await listener.stop()
+        except Exception:
+            pass
+
+        if shutdown_event.is_set():
+            break
+
+        # Wait with backoff (but respect shutdown during the wait)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=backoff)
+            break  # shutdown was requested during the wait
+        except asyncio.TimeoutError:
+            pass  # timeout expired, proceed to reconnect
+
+        backoff = min(backoff * 2, max_backoff)
+        log.info("Attempting to reconnect …")
+
+    # ── Cleanup ──
+    try:
+        await listener.stop()
+    except Exception:
+        pass
     await broker.shutdown()
     await db.close()
 

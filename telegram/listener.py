@@ -80,7 +80,24 @@ class TelegramListener:
     # ── Event handler ────────────────────────────────────────────────────
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        """Called for every new message in the target group."""
+        """Called for every new message in the target group.
+
+        This handler is wrapped in a top-level try/except so that **no
+        single message** — regardless of parser bugs, DB errors, broker
+        failures, or network issues — can crash the long-running daemon.
+        """
+        try:
+            await self._handle_message(event)
+        except Exception:
+            # Last-resort catch: log and continue listening
+            msg_id = getattr(getattr(event, "message", None), "id", "?")
+            logger.exception(
+                "Unhandled error processing message %s — skipping and continuing",
+                msg_id,
+            )
+
+    async def _handle_message(self, event: events.NewMessage.Event) -> None:
+        """Inner handler that does the actual work."""
         text: str = event.message.text or ""
         if not text.strip():
             return
@@ -95,7 +112,6 @@ class TelegramListener:
             text, message_id=msg_id, timestamp=timestamp
         )
         if signal is None:
-            # Log unparsed messages so we can improve the parser
             preview = text.replace("\n", " ").strip()
             if len(preview) > 200:
                 preview = preview[:200] + "…"
@@ -129,7 +145,11 @@ class TelegramListener:
             await self._broker.execute(signal, signal_id)
         except Exception:
             logger.exception("Broker execution failed for signal %s", signal.signal_hash)
-            return
+            # Don't return — still mark as processed to avoid retrying a
+            # signal that might cause repeated failures.
 
         # Mark processed
-        await self._db.mark_signal_processed(signal.signal_hash)
+        try:
+            await self._db.mark_signal_processed(signal.signal_hash)
+        except Exception:
+            logger.exception("Failed to mark signal %s as processed", signal.signal_hash)

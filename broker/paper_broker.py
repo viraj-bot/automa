@@ -133,6 +133,12 @@ class PaperBroker(BrokerInterface):
     # ── Entry ────────────────────────────────────────────────────────────
 
     async def execute_entry(self, signal: EntrySignal, signal_id: int) -> None:
+        try:
+            await self._execute_entry_inner(signal, signal_id)
+        except Exception:
+            logger.exception("[PAPER] Failed to execute entry for %s", signal.display_name)
+
+    async def _execute_entry_inner(self, signal: EntrySignal, signal_id: int) -> None:
         instrument = self.resolve_trading_symbol(
             signal.underlying,
             signal.expiry_day,
@@ -211,6 +217,12 @@ class PaperBroker(BrokerInterface):
     # ── Exit ─────────────────────────────────────────────────────────────
 
     async def execute_exit(self, signal: ExitSignal, signal_id: int) -> None:
+        try:
+            await self._execute_exit_inner(signal, signal_id)
+        except Exception:
+            logger.exception("[PAPER] Failed to execute exit for %s", signal.display_name)
+
+    async def _execute_exit_inner(self, signal: ExitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
             underlying=signal.underlying,
             strike_price=signal.strike_price,
@@ -220,7 +232,6 @@ class PaperBroker(BrokerInterface):
         )
 
         if position is None:
-            # Try broader match — just underlying
             positions = await self._db.find_all_open_positions_for_underlying(
                 signal.underlying
             )
@@ -229,12 +240,10 @@ class PaperBroker(BrokerInterface):
                     "[PAPER] No open position found for EXIT %s", signal.display_name
                 )
                 return
-            position = positions[0]  # close the most recent
+            position = positions[0]
 
         order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
 
-        # Use the explicit exit price from the signal when available,
-        # otherwise fall back to entry price (conservative).
         if signal.exit_price is not None:
             exit_price = signal.exit_price
         else:
@@ -273,6 +282,12 @@ class PaperBroker(BrokerInterface):
     # ── Book Profit ──────────────────────────────────────────────────────
 
     async def execute_book_profit(self, signal: BookProfitSignal, signal_id: int) -> None:
+        try:
+            await self._execute_book_profit_inner(signal, signal_id)
+        except Exception:
+            logger.exception("[PAPER] Failed to execute book profit for %s", signal.display_name)
+
+    async def _execute_book_profit_inner(self, signal: BookProfitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
             underlying=signal.underlying,
             strike_price=signal.strike_price,
@@ -297,9 +312,6 @@ class PaperBroker(BrokerInterface):
         quantity = int(position["quantity"])
         entry_price = float(position["avg_entry_price"])
 
-        # Determine how much to close.
-        # For partial book-profit with 1 lot, close the entire position
-        # (you can't split a single lot).
         if signal.is_partial:
             instrument = self.resolve_trading_symbol(
                 position["underlying"],
@@ -311,10 +323,8 @@ class PaperBroker(BrokerInterface):
             lot_size = instrument.get("lot_size", 1) if instrument else 1
 
             if quantity <= lot_size:
-                # 1 lot — close everything
                 close_qty = quantity
             else:
-                # Multiple lots — close ~50%, rounded to whole lots
                 close_qty = quantity // 2
                 if lot_size > 1 and close_qty >= lot_size:
                     close_qty = (close_qty // lot_size) * lot_size
@@ -348,7 +358,6 @@ class PaperBroker(BrokerInterface):
         pnl = (exit_price - entry_price) * close_qty
 
         if remaining_qty > 0:
-            # Partial close: reduce position, keep it open
             await self._db.partial_close_position(
                 position["id"],
                 close_qty=close_qty,
