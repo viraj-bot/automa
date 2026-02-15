@@ -795,7 +795,14 @@ class BacktestEngine:
         self, signal: BookProfitSignal
     ) -> bool:
         """When a book-profit signal arrives but the position is already closed
-        (by an earlier EXIT), update the trade log with the real exit price.
+        (by an earlier EXIT at an *estimated* price), update the trade log with
+        the real exit price.
+
+        This should ONLY update if the original exit used a fallback price
+        (target, stoploss, entry) — NOT if the position was already closed at
+        a real signal price from a prior BOOK_PROFIT.  Otherwise, subsequent
+        book-profit signals (e.g. Target 2 Hit after Target 1 already closed
+        the position) would incorrectly overwrite the actual exit price.
 
         Returns True if a matching closed position was found and updated.
         """
@@ -808,7 +815,30 @@ class BacktestEngine:
         if closed_pos is None:
             return False
 
+        # Find the corresponding trade log entry
         entry_price = float(closed_pos["avg_entry_price"])
+        matching_trade = None
+        for trade in self._trade_log:
+            if (trade["instrument"] == closed_pos["trading_symbol"]
+                    and trade["entry_price"] == entry_price):
+                matching_trade = trade
+                break
+
+        if matching_trade is None:
+            return False
+
+        # Only update if the original exit was at a fallback/estimated price.
+        # If it was already closed at a real "signal" or "groww" price, the
+        # exit is already accurate — don't overwrite it.
+        original_source = matching_trade.get("exit_source", "")
+        if original_source in ("signal", "groww"):
+            logger.debug(
+                "[BT] SKIP update for %s — already closed at real %s price ₹%.2f",
+                closed_pos["trading_symbol"], original_source,
+                matching_trade["exit_price"],
+            )
+            return True  # Return True to suppress the "unmatched" warning
+
         quantity = int(closed_pos["quantity"])
         new_exit = float(signal.exit_price)
         new_pnl = (new_exit - entry_price) * quantity
@@ -816,25 +846,21 @@ class BacktestEngine:
         # Update the DB
         await self._db.update_position_pnl(closed_pos["id"], new_pnl)
 
-        # Update the trade log entry for this position
-        for trade in self._trade_log:
-            if (trade["instrument"] == closed_pos["trading_symbol"]
-                    and trade["entry_price"] == entry_price):
-                old_pnl = trade["pnl"]
-                trade["exit_price"] = new_exit
-                trade["exit_source"] = "signal"
-                trade["close_type"] = "BOOK_PROFIT"
-                trade["pnl"] = new_pnl
-                logger.info(
-                    "[BT] UPDATED %s: exit ₹%.2f→₹%.2f (%s→signal) P&L ₹%.2f→₹%.2f",
-                    closed_pos["trading_symbol"],
-                    trade.get("exit_price", 0), new_exit,
-                    trade.get("exit_source", "?"),
-                    old_pnl, new_pnl,
-                )
-                return True
-
-        return False
+        # Update the trade log entry
+        old_pnl = matching_trade["pnl"]
+        old_exit = matching_trade["exit_price"]
+        old_source = matching_trade["exit_source"]
+        matching_trade["exit_price"] = new_exit
+        matching_trade["exit_source"] = "signal"
+        matching_trade["close_type"] = "BOOK_PROFIT"
+        matching_trade["pnl"] = new_pnl
+        logger.info(
+            "[BT] UPDATED %s: exit ₹%.2f→₹%.2f (%s→signal) P&L ₹%.2f→₹%.2f",
+            closed_pos["trading_symbol"],
+            old_exit, new_exit, old_source,
+            old_pnl, new_pnl,
+        )
+        return True
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
