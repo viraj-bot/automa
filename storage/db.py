@@ -375,3 +375,79 @@ class Database:
         )
         row = await cursor.fetchone()
         return dict(row) if row else {}
+
+    # ── Daily summary queries ─────────────────────────────────────────
+
+    async def get_today_closed_positions(self, date_str: str) -> list[dict[str, Any]]:
+        """Return all positions closed on the given date (YYYY-MM-DD)."""
+        cursor = await self.conn.execute(
+            """SELECT * FROM positions
+               WHERE status = 'CLOSED'
+                 AND date(closed_at) = ?
+               ORDER BY closed_at ASC""",
+            (date_str,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_today_opened_positions(self, date_str: str) -> list[dict[str, Any]]:
+        """Return all positions opened on the given date (YYYY-MM-DD)."""
+        cursor = await self.conn.execute(
+            """SELECT * FROM positions
+               WHERE date(opened_at) = ?
+               ORDER BY opened_at ASC""",
+            (date_str,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_today_trade_summary(self, date_str: str) -> dict[str, Any]:
+        """Return aggregate stats for positions closed on the given date."""
+        cursor = await self.conn.execute(
+            """SELECT
+                 COUNT(*)                                   AS total_trades,
+                 SUM(CASE WHEN pnl > 0  THEN 1 ELSE 0 END) AS wins,
+                 SUM(CASE WHEN pnl < 0  THEN 1 ELSE 0 END) AS losses,
+                 SUM(CASE WHEN pnl = 0  THEN 1 ELSE 0 END) AS breakeven,
+                 COALESCE(SUM(pnl), 0)                      AS total_pnl,
+                 COALESCE(AVG(pnl), 0)                      AS avg_pnl,
+                 COALESCE(MAX(pnl), 0)                      AS best_trade,
+                 COALESCE(MIN(pnl), 0)                      AS worst_trade
+               FROM positions
+               WHERE status = 'CLOSED'
+                 AND date(closed_at) = ?""",
+            (date_str,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else {}
+
+    async def get_overall_trade_summary(self) -> dict[str, Any]:
+        """Return lifetime aggregate stats for all closed positions."""
+        cursor = await self.conn.execute(
+            """SELECT
+                 COUNT(*)                                   AS total_trades,
+                 SUM(CASE WHEN pnl > 0  THEN 1 ELSE 0 END) AS wins,
+                 SUM(CASE WHEN pnl < 0  THEN 1 ELSE 0 END) AS losses,
+                 COALESCE(SUM(pnl), 0)                      AS total_pnl,
+                 COALESCE(AVG(pnl), 0)                      AS avg_pnl,
+                 COALESCE(MAX(pnl), 0)                      AS best_trade,
+                 COALESCE(MIN(pnl), 0)                      AS worst_trade
+               FROM positions WHERE status = 'CLOSED'"""
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else {}
+
+    async def get_signals_count_for_date(self, date_str: str) -> dict[str, int]:
+        """Return counts of signals received on the given date."""
+        cursor = await self.conn.execute(
+            """SELECT
+                 COUNT(*)                                                   AS total,
+                 SUM(CASE WHEN signal_type = 'ENTRY'       THEN 1 ELSE 0 END) AS entries,
+                 SUM(CASE WHEN signal_type = 'EXIT'        THEN 1 ELSE 0 END) AS exits,
+                 SUM(CASE WHEN signal_type = 'BOOK_PROFIT' THEN 1 ELSE 0 END) AS book_profits
+               FROM signals
+               WHERE date(received_at) = ?""",
+            (date_str,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else {"total": 0, "entries": 0, "exits": 0, "book_profits": 0}

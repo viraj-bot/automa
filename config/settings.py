@@ -91,6 +91,36 @@ class Settings(BaseSettings):
     # ── Logging ──
     log_level: str = Field(default="INFO", description="Logging level")
 
+    # ── Daily Summary Email ──
+    daily_summary_enabled: bool = Field(
+        default=True,
+        description="Send daily P&L summary email at market close",
+    )
+    daily_summary_time: str = Field(
+        default="15:30",
+        description="Time to send daily summary (HH:MM in IST, e.g. 15:30)",
+    )
+    summary_email_to: str = Field(
+        default="",
+        description="Recipient email address for daily summary",
+    )
+    smtp_host: str = Field(
+        default="smtp.gmail.com",
+        description="SMTP server hostname",
+    )
+    smtp_port: int = Field(
+        default=587,
+        description="SMTP server port (587 for TLS, 465 for SSL)",
+    )
+    smtp_user: str = Field(
+        default="",
+        description="SMTP username (email address for Gmail)",
+    )
+    smtp_password: str = Field(
+        default="",
+        description="SMTP password or app-specific password",
+    )
+
     # ── Derived / internal ──
     session_path: str = Field(
         default="data/automa_session",

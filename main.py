@@ -65,6 +65,7 @@ async def _run_live_or_paper(mode: str) -> None:
     from parser.signal_parser import SignalParser
     from storage.db import Database
     from telegram.listener import TelegramListener
+    from notifications.scheduler import run_daily_summary_scheduler
 
     log = logging.getLogger(__name__)
     settings = get_settings()
@@ -92,6 +93,11 @@ async def _run_live_or_paper(mode: str) -> None:
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
+
+    # ── Start the daily summary scheduler as a background task ──
+    scheduler_task = asyncio.create_task(
+        run_daily_summary_scheduler(settings, db, shutdown_event)
+    )
 
     # ── Reconnection loop ──
     max_backoff = 300  # 5 minutes
@@ -160,6 +166,11 @@ async def _run_live_or_paper(mode: str) -> None:
         log.info("Attempting to reconnect …")
 
     # ── Cleanup ──
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
     try:
         await listener.stop()
     except Exception:
