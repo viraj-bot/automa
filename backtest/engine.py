@@ -300,6 +300,67 @@ class BacktestEngine:
             )
             self._groww = None
 
+    # Hardcoded fallback lot sizes (Feb 2026, source: NSE / optionperks.com).
+    # Used only when the Groww instruments CSV is unavailable.
+    _FALLBACK_LOT_SIZES: dict[str, int] = {
+        # Indices
+        "NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120,
+        # Stocks (all F&O-eligible as of Feb 2026)
+        "360ONE": 500, "ABB": 125, "ABCAPITAL": 3100, "ADANIENSOL": 675,
+        "ADANIENT": 309, "ADANIGREEN": 600, "ADANIPORTS": 475, "ALKEM": 125,
+        "AMBER": 100, "AMBUJACEM": 1050, "ANGELONE": 250, "APLAPOLLO": 350,
+        "APOLLOHOSP": 125, "ASHOKLEY": 5000, "ASIANPAINT": 250, "ASTRAL": 425,
+        "AUBANK": 1000, "AUROPHARMA": 550, "AXISBANK": 625, "BAJAJ-AUTO": 75,
+        "BAJAJFINSV": 250, "BAJAJHLDNG": 50, "BAJFINANCE": 750,
+        "BANDHANBNK": 3600, "BANKBARODA": 2925, "BANKINDIA": 5200,
+        "BDL": 350, "BEL": 1425, "BHARATFORG": 500, "BHARTIARTL": 475,
+        "BHEL": 2625, "BIOCON": 2500, "BLUESTARCO": 325, "BOSCHLTD": 25,
+        "BPCL": 1975, "BRITANNIA": 125, "BSE": 375, "CAMS": 750,
+        "CANBK": 6750, "CDSL": 475, "CGPOWER": 850, "CHOLAFIN": 625,
+        "CIPLA": 375, "COALINDIA": 1350, "COFORGE": 375, "COLPAL": 225,
+        "CONCOR": 1250, "CROMPTON": 1800, "CUMMINSIND": 200, "DABUR": 1250,
+        "DALBHARAT": 325, "DELHIVERY": 2075, "DIVISLAB": 100, "DIXON": 50,
+        "DLF": 825, "DMART": 150, "DRREDDY": 625, "EICHERMOT": 100,
+        "ETERNAL": 2425, "EXIDEIND": 1800, "FEDERALBNK": 5000, "FORTIS": 775,
+        "GAIL": 3150, "GLENMARK": 375, "GMRAIRPORT": 6975, "GODREJCP": 500,
+        "GODREJPROP": 275, "GRASIM": 250, "HAL": 150, "HAVELLS": 500,
+        "HCLTECH": 350, "HDFCAMC": 300, "HDFCBANK": 550, "HDFCLIFE": 1100,
+        "HEROMOTOCO": 150, "HINDALCO": 700, "HINDPETRO": 2025,
+        "HINDUNILVR": 300, "HINDZINC": 1225, "HUDCO": 2775, "ICICIBANK": 700,
+        "ICICIGI": 325, "ICICIPRULI": 925, "IDEA": 71475, "IDFCFIRSTB": 9275,
+        "IEX": 3750, "INDHOTEL": 1000, "INDIANB": 1000, "INDIGO": 150,
+        "INDUSINDBK": 700, "INDUSTOWER": 1700, "INFY": 400, "INOXWIND": 3575,
+        "IOC": 4875, "IRCTC": 875, "IREDA": 3450, "IRFC": 4250,
+        "ITC": 1600, "JINDALSTEL": 625, "JIOFIN": 2350, "JSWENERGY": 1000,
+        "JSWSTEEL": 675, "JUBLFOOD": 1250, "KALYANKJIL": 1175, "KAYNES": 100,
+        "KEI": 175, "KFINTECH": 500, "KOTAKBANK": 2000, "KPITTECH": 425,
+        "LAURUSLABS": 850, "LICHSGFIN": 1000, "LICI": 700, "LODHA": 450,
+        "LT": 175, "LTF": 2250, "LTIM": 150, "LUPIN": 425, "M&M": 200,
+        "MANAPPURAM": 3000, "MANKIND": 225, "MARICO": 1200, "MARUTI": 50,
+        "MAXHEALTH": 525, "MAZDOCK": 200, "MCX": 625, "MFSL": 400,
+        "MOTHERSON": 6150, "MPHASIS": 275, "MUTHOOTFIN": 275,
+        "NATIONALUM": 3750, "NAUKRI": 375, "NBCC": 6500, "NESTLEIND": 500,
+        "NHPC": 6400, "NMDC": 6750, "NTPC": 1500, "NUVAMA": 500,
+        "NYKAA": 3125, "OBEROIRLTY": 350, "OFSS": 75, "OIL": 1400,
+        "ONGC": 2250, "PAGEIND": 15, "PATANJALI": 900, "PAYTM": 725,
+        "PERSISTENT": 100, "PETRONET": 1900, "PFC": 1300, "PGEL": 950,
+        "PHOENIXLTD": 350, "PIDILITIND": 500, "PIIND": 175, "PNB": 8000,
+        "PNBHOUSING": 650, "POLICYBZR": 350, "POLYCAB": 125,
+        "POWERGRID": 1900, "POWERINDIA": 50, "PPLPHARMA": 2625,
+        "PREMIERENE": 575, "PRESTIGE": 450, "RBLBANK": 3175, "RECLTD": 1400,
+        "RELIANCE": 500, "RVNL": 1525, "SAIL": 4700, "SAMMAANCAP": 4300,
+        "SBICARD": 800, "SBILIFE": 375, "SBIN": 750, "SHREECEM": 25,
+        "SHRIRAMFIN": 825, "SIEMENS": 175, "SOLARINDS": 50, "SONACOMS": 1225,
+        "SRF": 200, "SUNPHARMA": 350, "SUPREMEIND": 175, "SUZLON": 9025,
+        "SWIGGY": 1300, "SYNGENE": 1000, "TATACONSUM": 550, "TATAELXSI": 100,
+        "TATAPOWER": 1450, "TATASTEEL": 5500, "TATATECH": 800, "TCS": 175,
+        "TECHM": 600, "TIINDIA": 200, "TITAN": 175, "TMPV": 800,
+        "TORNTPHARM": 250, "TORNTPOWER": 425, "TRENT": 100, "TVSMOTOR": 175,
+        "ULTRACEMCO": 50, "UNIONBANK": 4425, "UNITDSPR": 400, "UNOMINDA": 550,
+        "UPL": 1355, "VBL": 1125, "VEDL": 1150, "VOLTAS": 375,
+        "WAAREEENER": 175, "WIPRO": 3000, "YESBANK": 31100, "ZYDUSLIFE": 900,
+    }
+
     def _resolve_lot_size(
         self,
         underlying: str,
@@ -309,19 +370,25 @@ class BacktestEngine:
         option_type: str,
         at_time: datetime,
     ) -> int:
-        """Look up the lot size for an instrument from the Groww instruments CSV.
+        """Look up the lot size for an instrument.
 
-        The lot size is the same for all instruments of a given underlying,
-        so we look up by underlying_symbol rather than exact groww_symbol
-        (which may not exist for expired instruments).
-
-        Returns the lot size from Groww if available, otherwise falls back to 1.
+        Priority:
+        1. Groww instruments CSV cache (live data)
+        2. Hardcoded fallback table (Feb 2026 NSE data)
+        3. Default to 1 (last resort)
         """
-        # Try the cached lot-size map first (built from instruments CSV)
+        sym = underlying.upper()
+
+        # 1. Try the cached lot-size map (built from Groww instruments CSV)
         if self._lot_size_cache is not None:
-            lot = self._lot_size_cache.get(underlying.upper())
+            lot = self._lot_size_cache.get(sym)
             if lot is not None:
                 return lot
+
+        # 2. Hardcoded fallback
+        lot = self._FALLBACK_LOT_SIZES.get(sym)
+        if lot is not None:
+            return lot
 
         logger.warning(
             "[BT] Lot size not found for %s, defaulting to 1", underlying,
@@ -640,12 +707,7 @@ class BacktestEngine:
 
         # ── Handle partial vs full book-profit ──
         if signal.is_partial:
-            # Close ~50% of the position, keep the rest open
-            close_qty = quantity // 2
-            if close_qty <= 0:
-                close_qty = quantity  # if only 1 lot, close it all
-
-            # Round to lot size if possible
+            # Resolve lot size to decide if we can actually split
             lot_size = self._resolve_lot_size(
                 position["underlying"],
                 position.get("expiry_day") or 1,
@@ -654,14 +716,24 @@ class BacktestEngine:
                 position.get("option_type") or "CE",
                 msg_time,
             )
-            if lot_size > 1 and close_qty >= lot_size:
-                close_qty = (close_qty // lot_size) * lot_size
 
-            remaining_qty = quantity - close_qty
+            # If trading only 1 lot (quantity <= lot_size), close the
+            # entire position — you can't split a single lot.
+            if quantity <= lot_size:
+                close_qty = quantity
+                remaining_qty = 0
+            else:
+                # Multiple lots: close ~50%, rounded down to whole lots
+                close_qty = quantity // 2
+                if lot_size > 1 and close_qty >= lot_size:
+                    close_qty = (close_qty // lot_size) * lot_size
+                if close_qty <= 0:
+                    close_qty = quantity
+                remaining_qty = quantity - close_qty
+
             partial_pnl = (exit_price - entry_price) * close_qty
 
             if remaining_qty > 0:
-                # Partial close: reduce quantity, keep position open
                 await self._db.partial_close_position(
                     position["id"],
                     close_qty=close_qty,
@@ -669,7 +741,6 @@ class BacktestEngine:
                 )
                 close_type = "PARTIAL"
             else:
-                # Closing everything (only 1 lot or rounding ate it all)
                 await self._db.close_position(position["id"], pnl=partial_pnl)
                 close_type = "BOOK_PROFIT"
 

@@ -114,6 +114,13 @@ class PaperBroker(BrokerInterface):
                         lot_size = int(fuzzy.iloc[0].get("lot_size", 1))
                         groww_sym = fuzzy.iloc[0]["groww_symbol"]
 
+        # If CSV lookup didn't find a lot size, use the hardcoded fallback
+        if lot_size <= 1:
+            from backtest.engine import BacktestEngine
+            lot_size = BacktestEngine._FALLBACK_LOT_SIZES.get(
+                underlying.upper(), 1
+            )
+
         lot_size = max(lot_size, 1)
         logger.debug("[PAPER] %s → lot_size=%d", groww_sym, lot_size)
 
