@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import pandas as pd
@@ -24,6 +24,20 @@ from storage.db import Database
 from telegram.history import fetch_chat_history
 
 logger = logging.getLogger(__name__)
+
+# IST = UTC+5:30
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _to_ist_str(dt: Any) -> str:
+    """Convert a datetime (typically UTC from Telegram) to an IST string."""
+    if not hasattr(dt, "strftime"):
+        return str(dt)
+    # If the datetime is naive or UTC, convert to IST
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_IST).strftime("%Y-%m-%d %H:%M")
+
 
 _MONTH_TITLE = {
     "JAN": "Jan", "FEB": "Feb", "MAR": "Mar", "APR": "Apr",
@@ -617,9 +631,8 @@ class BacktestEngine:
             is_paper=True,
         )
 
-        # Remember the entry message time for the trade log
-        entry_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
-        self._entry_times[ts] = entry_time_str
+        # Remember the entry message time for the trade log (in IST)
+        self._entry_times[ts] = _to_ist_str(msg_time)
 
         logger.info(
             "[BT] ENTRY %s x%d @ ₹%.2f (%s) | signal=₹%.2f SL=%s T=%s",
@@ -652,7 +665,7 @@ class BacktestEngine:
         pnl = (exit_price - entry_price) * quantity
         await self._db.close_position(position["id"], pnl=pnl)
 
-        exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
+        exit_time_str = _to_ist_str(msg_time)
         self._trade_log.append({
             "trade_no": len(self._trade_log) + 1,
             "instrument": position["trading_symbol"],
@@ -744,7 +757,7 @@ class BacktestEngine:
                 await self._db.close_position(position["id"], pnl=partial_pnl)
                 close_type = "BOOK_PROFIT"
 
-            exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
+            exit_time_str = _to_ist_str(msg_time)
             self._trade_log.append({
                 "trade_no": len(self._trade_log) + 1,
                 "instrument": position["trading_symbol"],
@@ -770,7 +783,7 @@ class BacktestEngine:
             pnl = (exit_price - entry_price) * quantity
             await self._db.close_position(position["id"], pnl=pnl)
 
-            exit_time_str = msg_time.strftime("%Y-%m-%d %H:%M") if hasattr(msg_time, "strftime") else str(msg_time)
+            exit_time_str = _to_ist_str(msg_time)
             self._trade_log.append({
                 "trade_no": len(self._trade_log) + 1,
                 "instrument": position["trading_symbol"],
