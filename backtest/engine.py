@@ -39,6 +39,17 @@ def _to_ist_str(dt: Any) -> str:
     return dt.astimezone(_IST).strftime("%Y-%m-%d %H:%M")
 
 
+def _parse_targets_for_log(targets_raw: Any) -> list[float]:
+    """Parse targets from DB storage (JSON string or list) into a list of floats."""
+    if not targets_raw:
+        return []
+    try:
+        targets = json.loads(targets_raw) if isinstance(targets_raw, str) else targets_raw
+        return [float(t) for t in targets if t is not None] if targets else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+
+
 _MONTH_TITLE = {
     "JAN": "Jan", "FEB": "Feb", "MAR": "Mar", "APR": "Apr",
     "MAY": "May", "JUN": "Jun", "JUL": "Jul", "AUG": "Aug",
@@ -679,6 +690,8 @@ class BacktestEngine:
             "pnl": pnl,
             "entry_time": self._entry_times.get(position["trading_symbol"], ""),
             "exit_time": exit_time_str,
+            "stoploss": position.get("stoploss"),
+            "targets": _parse_targets_for_log(position.get("targets")),
         })
 
         logger.info(
@@ -771,6 +784,8 @@ class BacktestEngine:
                 "pnl": partial_pnl,
                 "entry_time": self._entry_times.get(position["trading_symbol"], ""),
                 "exit_time": exit_time_str,
+                "stoploss": position.get("stoploss"),
+                "targets": _parse_targets_for_log(position.get("targets")),
             })
 
             logger.info(
@@ -797,6 +812,8 @@ class BacktestEngine:
                 "pnl": pnl,
                 "entry_time": self._entry_times.get(position["trading_symbol"], ""),
                 "exit_time": exit_time_str,
+                "stoploss": position.get("stoploss"),
+                "targets": _parse_targets_for_log(position.get("targets")),
             })
 
             logger.info(
@@ -1088,6 +1105,8 @@ class BacktestEngine:
                 "pnl": pnl,
                 "entry_time": self._entry_times.get(pos["trading_symbol"], ""),
                 "exit_time": "force-closed",
+                "stoploss": pos.get("stoploss"),
+                "targets": _parse_targets_for_log(pos.get("targets")),
             })
 
             logger.info(

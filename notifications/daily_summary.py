@@ -471,6 +471,19 @@ def _build_backtest_html(summary: dict[str, Any]) -> str:
                 "PARTIAL": "PARTIAL",
             }.get(t.get("close_type", ""), t.get("close_type", "—"))
 
+            # Format stoploss
+            sl_val = t.get("stoploss")
+            sl_str = f'₹{float(sl_val):,.2f}' if sl_val is not None and float(sl_val) > 0 else "—"
+
+            # Format targets
+            targets = t.get("targets", [])
+            if targets:
+                target_str = ", ".join(f"₹{v:,.0f}" for v in targets[:3])
+                if len(targets) > 3:
+                    target_str += "…"
+            else:
+                target_str = "—"
+
             trade_rows += f"""
             <tr>
                 <td class="text-center">{t.get('trade_no', '')}</td>
@@ -478,6 +491,8 @@ def _build_backtest_html(summary: dict[str, Any]) -> str:
                 <td class="text-right">{t.get('qty', 0)}</td>
                 <td class="text-center" style="font-size:11px">{entry_time}</td>
                 <td class="text-right">₹{t.get('entry_price', 0):,.2f}</td>
+                <td class="text-right" style="color:#dc2626">{sl_str}</td>
+                <td class="text-right" style="color:#0891b2">{target_str}</td>
                 <td class="text-center" style="font-size:11px">{exit_time}</td>
                 <td class="text-right">₹{t.get('exit_price', 0):,.2f}</td>
                 <td class="text-center">{exit_src}</td>
@@ -495,6 +510,8 @@ def _build_backtest_html(summary: dict[str, Any]) -> str:
                 <th class="text-right">Qty</th>
                 <th class="text-center">Entry Date</th>
                 <th class="text-right">Entry ₹</th>
+                <th class="text-right">SL ₹</th>
+                <th class="text-right">Target ₹</th>
                 <th class="text-center">Exit Date</th>
                 <th class="text-right">Exit ₹</th>
                 <th class="text-center">Source</th>

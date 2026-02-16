@@ -70,6 +70,8 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
     trade_table.add_column("Qty", justify="right", width=5)
     trade_table.add_column("Entry Date", width=12)
     trade_table.add_column("Entry ₹", justify="right", width=9)
+    trade_table.add_column("SL ₹", justify="right", width=8)
+    trade_table.add_column("Target ₹", justify="right", width=9)
     trade_table.add_column("Exit Date", width=12)
     trade_table.add_column("Exit ₹", justify="right", width=9)
     trade_table.add_column("Exit Src", width=9)
@@ -99,12 +101,28 @@ def print_backtest_report(summary: dict[str, Any]) -> None:
         entry_time = t.get("entry_time", "")
         exit_time = t.get("exit_time", "")
 
+        # Format stoploss
+        sl_val = t.get("stoploss")
+        sl_str = f"[red]{float(sl_val):,.2f}[/red]" if sl_val is not None and float(sl_val) > 0 else "[dim]—[/dim]"
+
+        # Format targets (show first target, or comma-separated if multiple)
+        targets = t.get("targets", [])
+        if targets:
+            target_str = ", ".join(f"{v:,.0f}" for v in targets[:3])
+            if len(targets) > 3:
+                target_str += "…"
+            target_str = f"[cyan]{target_str}[/cyan]"
+        else:
+            target_str = "[dim]—[/dim]"
+
         trade_table.add_row(
             str(t["trade_no"]),
             t["instrument"],
             str(t["qty"]),
             f"[dim]{entry_time}[/dim]",
             f"{t['entry_price']:,.2f}",
+            sl_str,
+            target_str,
             f"[dim]{exit_time}[/dim]",
             f"{t['exit_price']:,.2f}",
             f"[{src_colour}]{exit_src}[/{src_colour}]",

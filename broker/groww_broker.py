@@ -65,7 +65,7 @@ class GrowwBroker(BrokerInterface):
         logger.info("Groww API client initialised — loading instruments …")
 
         # Load instruments in a thread so we don't block the event loop
-        logger.debug("[GROWW REQ] get_all_instruments")
+        logger.info("[GROWW REQ] get_all_instruments")
         loop = asyncio.get_running_loop()
         self._instruments_df = await loop.run_in_executor(
             None, self._groww.get_all_instruments
@@ -74,7 +74,7 @@ class GrowwBroker(BrokerInterface):
             "Loaded %d instruments from Groww",
             len(self._instruments_df),
         )
-        logger.debug(
+        logger.info(
             "[GROWW RES] get_all_instruments: %d rows, columns=%s",
             len(self._instruments_df),
             list(self._instruments_df.columns),
@@ -230,8 +230,10 @@ class GrowwBroker(BrokerInterface):
             "transaction_type": "BUY",
             "price": signal.entry_price if not use_market else "MARKET",
             "product": product,
+            "stoploss": signal.stoploss,
+            "targets": signal.targets,
         }
-        logger.debug("[GROWW REQ] place_order BUY: %s", order_params)
+        logger.info("[GROWW REQ] place_order BUY: %s", order_params)
 
         try:
             response = await loop.run_in_executor(
@@ -242,14 +244,14 @@ class GrowwBroker(BrokerInterface):
             logger.exception("Failed to place BUY order for %s", signal.display_name)
             return
 
-        logger.debug("[GROWW RES] place_order BUY: %s", response)
+        logger.info("[GROWW RES] place_order BUY: %s", response)
         groww_order_id = response.get("groww_order_id", "")
         order_status = response.get("order_status", "UNKNOWN")
 
         logger.info(
-            "[LIVE] BUY %s x%d @ ₹%.2f  order_id=%s status=%s",
+            "[LIVE] BUY %s x%d @ ₹%.2f  order_id=%s status=%s  SL=%s Targets=%s",
             signal.display_name, quantity, signal.entry_price,
-            groww_order_id, order_status,
+            groww_order_id, order_status, signal.stoploss, signal.targets,
         )
 
         # Record in DB — if this fails, the order is live on Groww but
@@ -326,7 +328,7 @@ class GrowwBroker(BrokerInterface):
             "trigger_price": trigger_price,
             "product": product,
         }
-        logger.debug("[GROWW REQ] place_order SL: %s", sl_params)
+        logger.info("[GROWW REQ] place_order SL: %s", sl_params)
 
         try:
             response = await loop.run_in_executor(
@@ -343,7 +345,7 @@ class GrowwBroker(BrokerInterface):
                     trigger_price=trigger_price,
                 ),
             )
-            logger.debug("[GROWW RES] place_order SL: %s", response)
+            logger.info("[GROWW RES] place_order SL: %s", response)
             logger.info(
                 "[LIVE] SL order placed for %s @ ₹%.2f — %s",
                 instrument["trading_symbol"],
@@ -417,7 +419,7 @@ class GrowwBroker(BrokerInterface):
             "price": exit_price if order_type_str == "LIMIT" else "MARKET",
             "product": product,
         }
-        logger.debug("[GROWW REQ] place_order EXIT: %s", exit_params)
+        logger.info("[GROWW REQ] place_order EXIT: %s", exit_params)
 
         try:
             response = await loop.run_in_executor(
@@ -428,7 +430,7 @@ class GrowwBroker(BrokerInterface):
             logger.exception("[LIVE] Failed to place EXIT order for %s", position["trading_symbol"])
             return
 
-        logger.debug("[GROWW RES] place_order EXIT: %s", response)
+        logger.info("[GROWW RES] place_order EXIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
 
         pnl = 0.0
@@ -559,7 +561,7 @@ class GrowwBroker(BrokerInterface):
             "product": product,
             "partial": signal.is_partial,
         }
-        logger.debug("[GROWW REQ] place_order BOOK_PROFIT: %s", bp_params)
+        logger.info("[GROWW REQ] place_order BOOK_PROFIT: %s", bp_params)
 
         try:
             response = await loop.run_in_executor(
@@ -573,7 +575,7 @@ class GrowwBroker(BrokerInterface):
             )
             return
 
-        logger.debug("[GROWW RES] place_order BOOK_PROFIT: %s", response)
+        logger.info("[GROWW RES] place_order BOOK_PROFIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
 
         pnl = 0.0
