@@ -43,8 +43,8 @@ _setup_ssl_ca_bundle()
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(message)s",
-        datefmt="[%X]",
+        format="%(asctime)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[RichHandler(rich_tracebacks=True, markup=True)],
     )
     # Quiet noisy libraries
