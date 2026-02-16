@@ -10,8 +10,11 @@ import asyncio
 import logging
 import smtplib
 from datetime import datetime, timezone, timedelta
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
+from pathlib import Path
 from typing import Any
 
 from config.settings import Settings
@@ -66,6 +69,11 @@ async def generate_and_send_daily_summary(
 
         subject = _build_subject(today_display, today_summary)
 
+        # Locate today's daily message log file (if any)
+        from telegram.listener import TelegramListener
+        daily_log = TelegramListener.get_daily_log_path(today_str)
+        attachment = str(daily_log) if daily_log else None
+
         # Send email in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -78,6 +86,7 @@ async def generate_and_send_daily_summary(
             settings.summary_email_to,
             subject,
             html,
+            attachment,
         )
 
         logger.info("Daily summary email sent to %s", settings.summary_email_to)
@@ -135,50 +144,59 @@ def _build_html(
     sig_exits = signal_counts.get("exits", 0) or 0
     sig_bp = signal_counts.get("book_profits", 0) or 0
 
+    # ── Mode-specific banner colours ──
+    # LIVE = red, PAPER = yellow/amber, BACKTEST = green
+    _MODE_GRADIENTS = {
+        "LIVE": "linear-gradient(135deg, #b91c1c, #ef4444)",
+        "PAPER": "linear-gradient(135deg, #b45309, #f59e0b)",
+        "BACKTEST": "linear-gradient(135deg, #15803d, #22c55e)",
+    }
+    header_gradient = _MODE_GRADIENTS.get(mode, "linear-gradient(135deg, #1e40af, #3b82f6)")
+
     # ── Styles ──
-    css = """
+    css = f"""
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-               background: #f8fafc; margin: 0; padding: 20px; color: #1e293b; }
-        .container { max-width: 640px; margin: 0 auto; background: #ffffff;
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #f8fafc; margin: 0; padding: 20px; color: #1e293b; }}
+        .container {{ max-width: 640px; margin: 0 auto; background: #ffffff;
                      border-radius: 12px; overflow: hidden;
-                     box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .header { background: linear-gradient(135deg, #1e40af, #3b82f6);
-                  color: white; padding: 24px 28px; }
-        .header h1 { margin: 0; font-size: 22px; font-weight: 600; }
-        .header p { margin: 6px 0 0; opacity: 0.85; font-size: 14px; }
-        .mode-badge { display: inline-block; background: rgba(255,255,255,0.2);
+                     box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        .header {{ background: {header_gradient};
+                  color: white; padding: 24px 28px; }}
+        .header h1 {{ margin: 0; font-size: 22px; font-weight: 600; }}
+        .header p {{ margin: 6px 0 0; opacity: 0.85; font-size: 14px; }}
+        .mode-badge {{ display: inline-block; background: rgba(255,255,255,0.2);
                       padding: 2px 10px; border-radius: 12px; font-size: 11px;
-                      font-weight: 600; letter-spacing: 0.5px; margin-left: 8px; }
-        .content { padding: 24px 28px; }
-        .pnl-hero { text-align: center; padding: 20px 0; margin-bottom: 20px;
-                    border-bottom: 1px solid #e2e8f0; }
-        .pnl-hero .label { font-size: 13px; color: #64748b; text-transform: uppercase;
-                           letter-spacing: 1px; margin-bottom: 4px; }
-        .pnl-hero .amount { font-size: 36px; font-weight: 700; }
-        .pnl-positive { color: #16a34a; }
-        .pnl-negative { color: #dc2626; }
-        .pnl-zero { color: #6b7280; }
-        .stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px;
-                      margin-bottom: 24px; }
-        .stat-card { background: #f8fafc; border-radius: 8px; padding: 14px;
-                     text-align: center; }
-        .stat-card .value { font-size: 22px; font-weight: 700; color: #1e293b; }
-        .stat-card .label { font-size: 11px; color: #64748b; text-transform: uppercase;
-                            letter-spacing: 0.5px; margin-top: 2px; }
-        h2 { font-size: 16px; font-weight: 600; color: #334155;
-             margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 2px solid #e2e8f0; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { background: #f1f5f9; color: #475569; font-weight: 600; text-align: left;
+                      font-weight: 600; letter-spacing: 0.5px; margin-left: 8px; }}
+        .content {{ padding: 24px 28px; }}
+        .pnl-hero {{ text-align: center; padding: 20px 0; margin-bottom: 20px;
+                    border-bottom: 1px solid #e2e8f0; }}
+        .pnl-hero .label {{ font-size: 13px; color: #64748b; text-transform: uppercase;
+                           letter-spacing: 1px; margin-bottom: 4px; }}
+        .pnl-hero .amount {{ font-size: 36px; font-weight: 700; }}
+        .pnl-positive {{ color: #16a34a; }}
+        .pnl-negative {{ color: #dc2626; }}
+        .pnl-zero {{ color: #6b7280; }}
+        .stats-grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px;
+                      margin-bottom: 24px; }}
+        .stat-card {{ background: #f8fafc; border-radius: 8px; padding: 14px;
+                     text-align: center; }}
+        .stat-card .value {{ font-size: 22px; font-weight: 700; color: #1e293b; }}
+        .stat-card .label {{ font-size: 11px; color: #64748b; text-transform: uppercase;
+                            letter-spacing: 0.5px; margin-top: 2px; }}
+        h2 {{ font-size: 16px; font-weight: 600; color: #334155;
+             margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 2px solid #e2e8f0; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        th {{ background: #f1f5f9; color: #475569; font-weight: 600; text-align: left;
              padding: 8px 10px; font-size: 11px; text-transform: uppercase;
-             letter-spacing: 0.5px; }
-        td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
-        tr:last-child td { border-bottom: none; }
-        .text-right { text-align: right; }
-        .text-center { text-align: center; }
-        .footer { background: #f8fafc; padding: 16px 28px; text-align: center;
-                  font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0; }
-        .no-trades { text-align: center; padding: 30px; color: #94a3b8; font-size: 14px; }
+             letter-spacing: 0.5px; }}
+        td {{ padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }}
+        tr:last-child td {{ border-bottom: none; }}
+        .text-right {{ text-align: right; }}
+        .text-center {{ text-align: center; }}
+        .footer {{ background: #f8fafc; padding: 16px 28px; text-align: center;
+                  font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0; }}
+        .no-trades {{ text-align: center; padding: 30px; color: #94a3b8; font-size: 14px; }}
     </style>
     """
 
@@ -319,7 +337,7 @@ def _build_html(
         {overall_section}
     </div>
     <div class="footer">
-        Generated by Automa at {datetime.now(IST).strftime('%I:%M %p IST')}
+        Generated by Automa ({mode}) at {datetime.now(IST).strftime('%I:%M %p IST on %d %b %Y')}
     </div>
 </div>
 </body>
@@ -417,7 +435,7 @@ def _build_backtest_html(summary: dict[str, Any]) -> str:
         .container { max-width: 720px; margin: 0 auto; background: #ffffff;
                      border-radius: 12px; overflow: hidden;
                      box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .header { background: linear-gradient(135deg, #7c3aed, #a855f7);
+        .header { background: linear-gradient(135deg, #15803d, #22c55e);
                   color: white; padding: 24px 28px; }
         .header h1 { margin: 0; font-size: 22px; font-weight: 600; }
         .header p { margin: 6px 0 0; opacity: 0.85; font-size: 14px; }
@@ -625,21 +643,44 @@ def _send_email(
     to_addr: str,
     subject: str,
     html_body: str,
+    attachment_path: str | None = None,
 ) -> None:
-    """Send an HTML email via SMTP (blocking — run in executor)."""
-    msg = MIMEMultipart("alternative")
+    """Send an HTML email via SMTP (blocking — run in executor).
+
+    If *attachment_path* is provided and the file exists, it is attached
+    to the email as a text file.
+    """
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = smtp_user
     msg["To"] = to_addr
 
-    # Plain-text fallback
+    # HTML + plain-text alternative part
+    alt_part = MIMEMultipart("alternative")
     plain = (
         f"{subject}\n\n"
         "This email is best viewed in an HTML-capable email client.\n"
         "Please enable HTML to see the full daily summary."
     )
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
+    alt_part.attach(MIMEText(plain, "plain"))
+    alt_part.attach(MIMEText(html_body, "html"))
+    msg.attach(alt_part)
+
+    # Attach daily log file if available
+    if attachment_path:
+        att_path = Path(attachment_path)
+        if att_path.exists() and att_path.stat().st_size > 0:
+            try:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(att_path.read_bytes())
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f"attachment; filename={att_path.name}",
+                )
+                msg.attach(part)
+            except Exception:
+                logger.debug("Failed to attach log file %s", att_path, exc_info=True)
 
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.ehlo()
