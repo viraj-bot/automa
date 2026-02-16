@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from typing import Optional
 
 from telethon import TelegramClient, events
@@ -14,14 +12,9 @@ from config.settings import Settings
 from parser.models import TradeSignal
 from parser.signal_parser import SignalParser
 from storage.db import Database
+from storage.daily_log import append_message
 
 logger = logging.getLogger(__name__)
-
-# IST = UTC+5:30
-_IST = timezone(timedelta(hours=5, minutes=30))
-
-# Directory for daily message log files
-_LOGS_DIR = Path("data/logs")
 
 
 class TelegramListener:
@@ -85,36 +78,6 @@ class TelegramListener:
             await self._client.disconnect()
             logger.info("Telegram listener stopped")
 
-    # ── Daily log rotation ────────────────────────────────────────────────
-
-    @staticmethod
-    def _append_to_daily_log(msg_id: int, timestamp: datetime, text: str) -> None:
-        """Append a message to today's log file at ``data/logs/<YYYY-MM-DD>.txt``.
-
-        Each day gets its own file, providing automatic log rotation.
-        """
-        try:
-            _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            ist_time = timestamp.astimezone(_IST) if timestamp.tzinfo else timestamp
-            date_str = ist_time.strftime("%Y-%m-%d")
-            time_str = ist_time.strftime("%Y-%m-%d %H:%M:%S")
-            log_path = _LOGS_DIR / f"{date_str}.txt"
-
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"=== MSG #{msg_id} | {time_str} ===\n")
-                f.write(text)
-                f.write("\n\n")
-        except Exception:
-            logger.debug("Failed to write message %s to daily log", msg_id, exc_info=True)
-
-    @staticmethod
-    def get_daily_log_path(date_str: str | None = None) -> Path | None:
-        """Return the path to today's (or a specific date's) log file, or None."""
-        if date_str is None:
-            date_str = datetime.now(_IST).strftime("%Y-%m-%d")
-        log_path = _LOGS_DIR / f"{date_str}.txt"
-        return log_path if log_path.exists() else None
-
     # ── Event handler ────────────────────────────────────────────────────
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
@@ -143,8 +106,13 @@ class TelegramListener:
         msg_id = event.message.id
         timestamp = event.message.date
 
-        # Append every message to the daily log file (data/logs/<date>.txt)
-        self._append_to_daily_log(msg_id, timestamp, text)
+        # Append every message to the mode-specific daily log file
+        append_message(
+            mode=self._settings.mode.value,
+            msg_id=msg_id,
+            timestamp=timestamp,
+            text=text,
+        )
 
         logger.debug("New message [%d]: %s", msg_id, text[:120])
 

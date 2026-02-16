@@ -21,6 +21,7 @@ from parser.models import (
 )
 from parser.signal_parser import SignalParser
 from storage.db import Database
+from storage.daily_log import append_message as append_daily_log
 from telegram.history import fetch_chat_history
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,14 @@ class BacktestEngine:
 
         unparsed_count = 0
         for msg in messages:
+            # Log every message to the backtest daily log
+            append_daily_log(
+                mode="backtest",
+                msg_id=msg["id"],
+                timestamp=msg["date"],
+                text=msg["text"],
+            )
+
             signal = self._parser.parse(
                 msg["text"],
                 message_id=msg["id"],

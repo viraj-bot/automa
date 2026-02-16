@@ -69,9 +69,10 @@ async def generate_and_send_daily_summary(
 
         subject = _build_subject(today_display, today_summary)
 
-        # Locate today's daily message log file (if any)
-        from telegram.listener import TelegramListener
-        daily_log = TelegramListener.get_daily_log_path(today_str)
+        # Locate today's daily message log file for the current mode
+        from storage.daily_log import get_daily_log_path
+        mode_str = settings.mode.value
+        daily_log = get_daily_log_path(mode=mode_str, date_str=today_str)
         attachment = str(daily_log) if daily_log else None
 
         # Send email in a thread to avoid blocking the event loop
@@ -372,6 +373,12 @@ async def send_backtest_summary_email(
     else:
         subject = f"Automa Backtest Report — {days} days — {total_trades} trades — {sign}₹{total_pnl:,.2f}"
 
+    # Locate today's backtest log file (if any)
+    from storage.daily_log import get_daily_log_path
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    daily_log = get_daily_log_path(mode="backtest", date_str=today_str)
+    attachment = str(daily_log) if daily_log else None
+
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -384,6 +391,7 @@ async def send_backtest_summary_email(
             settings.summary_email_to,
             subject,
             html,
+            attachment,
         )
         logger.info("Backtest summary email sent to %s", settings.summary_email_to)
     except Exception:
