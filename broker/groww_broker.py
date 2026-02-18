@@ -43,21 +43,40 @@ class GrowwBroker(BrokerInterface):
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Exchange API key + secret for an access token, then load instruments."""
-        logger.info("Groww API: exchanging API key + secret for access token …")
+        """Obtain an access token (TOTP preferred, API-key/secret fallback), then load instruments."""
         loop = asyncio.get_running_loop()
+        use_totp = bool(
+            self._settings.groww_totp_token and self._settings.groww_totp_secret
+        )
+
         try:
-            access_token = await loop.run_in_executor(
-                None,
-                lambda: GrowwAPI.get_access_token(
-                    api_key=self._settings.groww_api_token,
-                    secret=self._settings.groww_api_secret,
-                ),
-            )
+            if use_totp:
+                import pyotp
+
+                logger.info("Groww API: authenticating via TOTP (no daily approval needed) …")
+                totp_code = pyotp.TOTP(self._settings.groww_totp_secret).now()
+                access_token = await loop.run_in_executor(
+                    None,
+                    lambda: GrowwAPI.get_access_token(
+                        api_key=self._settings.groww_totp_token,
+                        totp=totp_code,
+                    ),
+                )
+            else:
+                logger.info("Groww API: authenticating via API key + secret (requires daily approval) …")
+                access_token = await loop.run_in_executor(
+                    None,
+                    lambda: GrowwAPI.get_access_token(
+                        api_key=self._settings.groww_api_token,
+                        secret=self._settings.groww_api_secret,
+                    ),
+                )
         except Exception:
+            method = "TOTP" if use_totp else "API key/secret"
             logger.exception(
-                "Failed to obtain Groww access token. "
-                "Check GROWW_API_TOKEN and GROWW_API_SECRET in .env"
+                "Failed to obtain Groww access token via %s. "
+                "Check your .env credentials.",
+                method,
             )
             raise
 

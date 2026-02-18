@@ -51,8 +51,18 @@ class Settings(BaseSettings):
     # ── Groww ──
     groww_api_token: str = Field(..., description="Groww Trade API key (JWT)")
     groww_api_secret: str = Field(
-        ...,
-        description="Groww Trade API secret (used to generate access token)",
+        default="",
+        description="Groww Trade API secret (used with API-key/secret flow, requires daily approval)",
+    )
+
+    # TOTP-based auth (no daily approval needed)
+    groww_totp_token: str = Field(
+        default="",
+        description="Groww TOTP token (from API Keys page → Generate TOTP token)",
+    )
+    groww_totp_secret: str = Field(
+        default="",
+        description="Groww TOTP secret (used to generate time-based OTP codes)",
     )
 
     # ── App mode ──

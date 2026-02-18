@@ -38,12 +38,18 @@ logger = logging.getLogger("test_groww")
 
 API_KEY = os.getenv("GROWW_API_TOKEN", "")
 API_SECRET = os.getenv("GROWW_API_SECRET", "")
-if not API_KEY:
-    logger.error("GROWW_API_TOKEN not set in .env — aborting")
-    sys.exit(1)
-if not API_SECRET or API_SECRET == "your_api_secret_here":
-    logger.error("GROWW_API_SECRET not set in .env — aborting")
-    sys.exit(1)
+TOTP_TOKEN = os.getenv("GROWW_TOTP_TOKEN", "")
+TOTP_SECRET = os.getenv("GROWW_TOTP_SECRET", "")
+
+USE_TOTP = bool(TOTP_TOKEN and TOTP_SECRET)
+
+if not USE_TOTP:
+    if not API_KEY:
+        logger.error("GROWW_API_TOKEN not set in .env — aborting")
+        sys.exit(1)
+    if not API_SECRET or API_SECRET == "your_api_secret_here":
+        logger.error("GROWW_API_SECRET not set in .env — aborting")
+        sys.exit(1)
 
 # ── Sample messages (from user-provided logs) ────────────────────────────────
 
@@ -106,28 +112,46 @@ def test_parser():
 
 
 def test_auth():
-    """Exchange API key + secret for access token, then verify with user profile."""
-    divider("TEST 2: Groww API Authentication (two-step)")
+    """Authenticate via TOTP (preferred) or API key + secret, then verify with user profile."""
+    divider("TEST 2: Groww API Authentication")
     from growwapi import GrowwAPI
 
-    # Step 1: Exchange API key + secret for access token
-    print("  Step 1: Exchanging API key + secret for access token …")
-    try:
-        access_token = GrowwAPI.get_access_token(
-            api_key=API_KEY,
-            secret=API_SECRET,
-        )
-        print(f"  ✓ Got access token: {str(access_token)[:60]}…")
-    except Exception as exc:
-        is_ssl = "SSL" in str(exc)
-        logger.error("[GROWW ERR] get_access_token failed: %s", exc)
-        if is_ssl:
-            print(f"  ✗ SSL ERROR: {exc}")
-            print("  → Corporate proxy detected. Create data/ca-bundle.pem with your root CA.")
-        else:
-            print(f"  ✗ Failed to get access token: {exc}")
-            print("  → Check GROWW_API_TOKEN and GROWW_API_SECRET in .env")
-        return None, False
+    if USE_TOTP:
+        import pyotp
+
+        print("  Auth method: TOTP (no daily approval needed)")
+        print("  Step 1: Generating TOTP code and exchanging for access token …")
+        try:
+            totp_code = pyotp.TOTP(TOTP_SECRET).now()
+            access_token = GrowwAPI.get_access_token(
+                api_key=TOTP_TOKEN,
+                totp=totp_code,
+            )
+            print(f"  ✓ Got access token: {str(access_token)[:60]}…")
+        except Exception as exc:
+            logger.error("[GROWW ERR] TOTP get_access_token failed: %s", exc)
+            print(f"  ✗ Failed: {exc}")
+            print("  → Check GROWW_TOTP_TOKEN and GROWW_TOTP_SECRET in .env")
+            return None, False
+    else:
+        print("  Auth method: API Key + Secret (requires daily approval)")
+        print("  Step 1: Exchanging API key + secret for access token …")
+        try:
+            access_token = GrowwAPI.get_access_token(
+                api_key=API_KEY,
+                secret=API_SECRET,
+            )
+            print(f"  ✓ Got access token: {str(access_token)[:60]}…")
+        except Exception as exc:
+            is_ssl = "SSL" in str(exc)
+            logger.error("[GROWW ERR] get_access_token failed: %s", exc)
+            if is_ssl:
+                print(f"  ✗ SSL ERROR: {exc}")
+                print("  → Corporate proxy detected. Create data/ca-bundle.pem with your root CA.")
+            else:
+                print(f"  ✗ Failed to get access token: {exc}")
+                print("  → Check GROWW_API_TOKEN and GROWW_API_SECRET in .env")
+            return None, False
 
     # Step 2: Use access token for authenticated requests
     api = GrowwAPI(access_token)
