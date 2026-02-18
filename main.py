@@ -17,9 +17,18 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from rich.logging import RichHandler
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+class _ISTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=_IST)
+        return dt.strftime(datefmt or "%d-%m-%Y %H:%M:%S")
 
 
 def _setup_ssl_ca_bundle() -> None:
@@ -41,11 +50,11 @@ _setup_ssl_ca_bundle()
 
 
 def _setup_logging(level: str) -> None:
+    handler = RichHandler(rich_tracebacks=True, markup=True)
+    handler.setFormatter(_ISTFormatter("%(asctime)s  %(message)s", datefmt="%d-%m-%Y %H:%M:%S"))
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[RichHandler(rich_tracebacks=True, markup=True)],
+        handlers=[handler],
     )
     # Quiet noisy libraries
     logging.getLogger("telethon").setLevel(logging.WARNING)
