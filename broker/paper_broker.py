@@ -19,6 +19,8 @@ from config.settings import Settings
 from parser.models import BookProfitSignal, EntrySignal, ExitSignal
 from storage.db import Database
 
+from config.log_config import TAG_PAPER, TAG_RISK
+
 logger = logging.getLogger(__name__)
 
 _MONTH_MAP = {
@@ -40,7 +42,7 @@ class PaperBroker(BrokerInterface):
 
     async def initialize(self) -> None:
         """Load the Groww instruments CSV for accurate lot sizes."""
-        logger.info("PaperBroker initialising — loading instruments for lot sizes …")
+        logger.info("%s Initialising — loading instruments for lot sizes …", TAG_PAPER)
         try:
             from growwapi import GrowwAPI
 
@@ -50,18 +52,18 @@ class PaperBroker(BrokerInterface):
                 None, api.get_all_instruments,
             )
             logger.info(
-                "PaperBroker loaded %d instruments (lot sizes available)",
-                len(self._instruments_df),
+                "%s Loaded %d instruments (lot sizes available)",
+                TAG_PAPER, len(self._instruments_df),
             )
         except Exception:
             logger.warning(
-                "Could not load instruments CSV — paper trades will use lot_size=1",
-                exc_info=True,
+                "%s Could not load instruments CSV — paper trades will use lot_size=1",
+                TAG_PAPER, exc_info=True,
             )
             self._instruments_df = None
 
     async def shutdown(self) -> None:
-        logger.info("PaperBroker shut down")
+        logger.info("%s PaperBroker shut down", TAG_PAPER)
 
     # ── Instrument resolution (paper mode: passthrough) ──────────────────
 
@@ -136,7 +138,7 @@ class PaperBroker(BrokerInterface):
         try:
             await self._execute_entry_inner(signal, signal_id)
         except Exception:
-            logger.exception("[PAPER] Failed to execute entry for %s", signal.display_name)
+            logger.exception("%s Failed to execute entry for %s", TAG_PAPER, signal.display_name)
 
     async def _execute_entry_inner(self, signal: EntrySignal, signal_id: int) -> None:
         instrument = self.resolve_trading_symbol(
@@ -147,7 +149,7 @@ class PaperBroker(BrokerInterface):
             signal.option_type.value,
         )
         if instrument is None:
-            logger.warning("Could not resolve instrument for %s", signal.display_name)
+            logger.warning("%s Could not resolve instrument for %s", TAG_PAPER, signal.display_name)
             return
 
         lot_size = max(instrument.get("lot_size", 1), 1)
@@ -158,10 +160,8 @@ class PaperBroker(BrokerInterface):
             risk = (signal.entry_price - signal.stoploss) * quantity
             if risk > self._settings.max_risk_per_trade:
                 logger.warning(
-                    "SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
-                    signal.display_name,
-                    risk,
-                    self._settings.max_risk_per_trade,
+                    "%s SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
+                    TAG_RISK, signal.display_name, risk, self._settings.max_risk_per_trade,
                 )
                 return
 
@@ -206,12 +206,9 @@ class PaperBroker(BrokerInterface):
         )
 
         logger.info(
-            "[PAPER] BUY %s x%d @ ₹%.2f  (SL: %s, Targets: %s)",
-            signal.display_name,
-            quantity,
-            signal.entry_price,
-            signal.stoploss,
-            signal.targets,
+            "%s BUY %s x%d @ ₹%.2f | SL=₹%s Targets=%s",
+            TAG_PAPER, signal.display_name, quantity, signal.entry_price,
+            signal.stoploss, signal.targets,
         )
 
     # ── Exit ─────────────────────────────────────────────────────────────
@@ -220,7 +217,7 @@ class PaperBroker(BrokerInterface):
         try:
             await self._execute_exit_inner(signal, signal_id)
         except Exception:
-            logger.exception("[PAPER] Failed to execute exit for %s", signal.display_name)
+            logger.exception("%s Failed to execute exit for %s", TAG_PAPER, signal.display_name)
 
     async def _execute_exit_inner(self, signal: ExitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
@@ -237,7 +234,7 @@ class PaperBroker(BrokerInterface):
             )
             if not positions:
                 logger.warning(
-                    "[PAPER] No open position found for EXIT %s", signal.display_name
+                    "%s No open position found for EXIT %s", TAG_PAPER, signal.display_name
                 )
                 return
             position = positions[0]
@@ -272,11 +269,9 @@ class PaperBroker(BrokerInterface):
         await self._db.close_position(position["id"], pnl=pnl)
 
         logger.info(
-            "[PAPER] EXIT %s x%d @ ₹%.2f  P&L: ₹%.2f",
-            position["trading_symbol"],
-            position["quantity"],
-            exit_price,
-            pnl,
+            "%s EXIT %s x%d @ ₹%.2f | P&L: ₹%.2f",
+            TAG_PAPER, position["trading_symbol"], position["quantity"],
+            exit_price, pnl,
         )
 
     # ── Book Profit ──────────────────────────────────────────────────────
@@ -285,7 +280,7 @@ class PaperBroker(BrokerInterface):
         try:
             await self._execute_book_profit_inner(signal, signal_id)
         except Exception:
-            logger.exception("[PAPER] Failed to execute book profit for %s", signal.display_name)
+            logger.exception("%s Failed to execute book profit for %s", TAG_PAPER, signal.display_name)
 
     async def _execute_book_profit_inner(self, signal: BookProfitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
@@ -302,8 +297,8 @@ class PaperBroker(BrokerInterface):
             )
             if not positions:
                 logger.warning(
-                    "[PAPER] No open position found for BOOK_PROFIT %s",
-                    signal.display_name,
+                    "%s No open position found for BOOK_PROFIT %s",
+                    TAG_PAPER, signal.display_name,
                 )
                 return
             position = positions[0]
@@ -364,13 +359,13 @@ class PaperBroker(BrokerInterface):
                 partial_pnl=pnl,
             )
             logger.info(
-                "[PAPER] PARTIAL_BP %s  closed %d/%d @ ₹%.2f  P&L: ₹%.2f  remaining: %d",
-                position["trading_symbol"], close_qty, quantity,
+                "%s PARTIAL_BP %s | closed %d/%d @ ₹%.2f | P&L: ₹%.2f | remaining=%d",
+                TAG_PAPER, position["trading_symbol"], close_qty, quantity,
                 exit_price, pnl, remaining_qty,
             )
         else:
             await self._db.close_position(position["id"], pnl=pnl)
             logger.info(
-                "[PAPER] BOOK_PROFIT %s x%d @ ₹%.2f  P&L: ₹%.2f",
-                position["trading_symbol"], close_qty, exit_price, pnl,
+                "%s BOOK_PROFIT %s x%d @ ₹%.2f | P&L: ₹%.2f",
+                TAG_PAPER, position["trading_symbol"], close_qty, exit_price, pnl,
             )

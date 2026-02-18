@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,15 +29,11 @@ if _ca_bundle.exists() and _ca_bundle.stat().st_size > 0:
     os.environ.setdefault("REQUESTS_CA_BUNDLE", _bundle)
     os.environ.setdefault("SSL_CERT_FILE", _bundle)
 
-_IST = timezone(timedelta(hours=5, minutes=30))
-
-class _ISTFormatter(logging.Formatter):
-    def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, tz=_IST)
-        return dt.strftime(datefmt or "%d-%m-%Y %H:%M:%S")
+sys.path.insert(0, os.path.dirname(__file__))
+from config.log_config import ISTFormatter
 
 _handler = logging.StreamHandler()
-_handler.setFormatter(_ISTFormatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%d-%m-%Y %H:%M:%S"))
+_handler.setFormatter(ISTFormatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%d-%m-%Y %H:%M:%S"))
 logging.basicConfig(level=logging.DEBUG, handlers=[_handler])
 logger = logging.getLogger("test_groww")
 
@@ -91,7 +86,6 @@ def test_parser():
     """Parse sample messages — pure local, no API calls."""
     divider("TEST 1: Signal Parser (local)")
 
-    sys.path.insert(0, os.path.dirname(__file__))
     from parser.signal_parser import SignalParser
 
     parser = SignalParser()

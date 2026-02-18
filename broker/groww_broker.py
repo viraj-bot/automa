@@ -16,6 +16,10 @@ from config.settings import Settings
 from parser.models import BookProfitSignal, EntrySignal, ExitSignal
 from storage.db import Database
 
+from config.log_config import (
+    TAG_GROWW_REQ, TAG_GROWW_RES, TAG_LIVE, TAG_RISK, TAG_CRITICAL,
+)
+
 logger = logging.getLogger(__name__)
 
 # Month abbreviation mapping for Groww symbol construction
@@ -53,7 +57,7 @@ class GrowwBroker(BrokerInterface):
             if use_totp:
                 import pyotp
 
-                logger.info("Groww API: authenticating via TOTP (no daily approval needed) …")
+                logger.info("%s Authenticating via TOTP (no daily approval needed) …", TAG_GROWW_REQ)
                 totp_code = pyotp.TOTP(self._settings.groww_totp_secret).now()
                 access_token = await loop.run_in_executor(
                     None,
@@ -63,7 +67,7 @@ class GrowwBroker(BrokerInterface):
                     ),
                 )
             else:
-                logger.info("Groww API: authenticating via API key + secret (requires daily approval) …")
+                logger.info("%s Authenticating via API key + secret (requires daily approval) …", TAG_GROWW_REQ)
                 access_token = await loop.run_in_executor(
                     None,
                     lambda: GrowwAPI.get_access_token(
@@ -81,26 +85,20 @@ class GrowwBroker(BrokerInterface):
             raise
 
         self._groww = GrowwAPI(access_token)
-        logger.info("Groww API client initialised — loading instruments …")
+        logger.info("%s Authenticated — loading instruments …", TAG_GROWW_RES)
 
-        # Load instruments in a thread so we don't block the event loop
-        logger.info("[GROWW REQ] get_all_instruments")
+        logger.info("%s get_all_instruments", TAG_GROWW_REQ)
         loop = asyncio.get_running_loop()
         self._instruments_df = await loop.run_in_executor(
             None, self._groww.get_all_instruments
         )
         logger.info(
-            "Loaded %d instruments from Groww",
-            len(self._instruments_df),
-        )
-        logger.info(
-            "[GROWW RES] get_all_instruments: %d rows, columns=%s",
-            len(self._instruments_df),
-            list(self._instruments_df.columns),
+            "%s Loaded %d instruments (%d columns)",
+            TAG_GROWW_RES, len(self._instruments_df), len(self._instruments_df.columns),
         )
 
     async def shutdown(self) -> None:
-        logger.info("GrowwBroker shut down")
+        logger.info("%s GrowwBroker shut down", TAG_LIVE)
 
     @property
     def groww(self) -> GrowwAPI:
@@ -191,7 +189,7 @@ class GrowwBroker(BrokerInterface):
         try:
             await self._execute_entry_inner(signal, signal_id)
         except Exception:
-            logger.exception("[LIVE] Unhandled error in execute_entry for %s", signal.display_name)
+            logger.exception("%s Unhandled error in execute_entry for %s", TAG_LIVE, signal.display_name)
 
     async def _execute_entry_inner(self, signal: EntrySignal, signal_id: int) -> None:
         instrument = self.resolve_trading_symbol(
@@ -202,7 +200,7 @@ class GrowwBroker(BrokerInterface):
             signal.option_type.value,
         )
         if instrument is None:
-            logger.error("Cannot execute entry — instrument not found for %s", signal.display_name)
+            logger.error("%s Cannot execute entry — instrument not found for %s", TAG_LIVE, signal.display_name)
             return
 
         lot_size = max(instrument.get("lot_size", 1), 1)
@@ -213,8 +211,8 @@ class GrowwBroker(BrokerInterface):
             risk = (signal.entry_price - signal.stoploss) * quantity
             if risk > self._settings.max_risk_per_trade:
                 logger.warning(
-                    "SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
-                    signal.display_name, risk, self._settings.max_risk_per_trade,
+                    "%s SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
+                    TAG_RISK, signal.display_name, risk, self._settings.max_risk_per_trade,
                 )
                 return
 
@@ -252,7 +250,7 @@ class GrowwBroker(BrokerInterface):
             "stoploss": signal.stoploss,
             "targets": signal.targets,
         }
-        logger.info("[GROWW REQ] place_order BUY: %s", order_params)
+        logger.info("%s place_order BUY %s", TAG_GROWW_REQ, order_params)
 
         try:
             response = await loop.run_in_executor(
@@ -260,16 +258,15 @@ class GrowwBroker(BrokerInterface):
                 lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
-            logger.exception("Failed to place BUY order for %s", signal.display_name)
+            logger.exception("%s Failed to place BUY order for %s", TAG_LIVE, signal.display_name)
             return
 
-        logger.info("[GROWW RES] place_order BUY: %s", response)
         groww_order_id = response.get("groww_order_id", "")
         order_status = response.get("order_status", "UNKNOWN")
-
+        logger.info("%s place_order BUY → %s", TAG_GROWW_RES, response)
         logger.info(
-            "[LIVE] BUY %s x%d @ ₹%.2f  order_id=%s status=%s  SL=%s Targets=%s",
-            signal.display_name, quantity, signal.entry_price,
+            "%s BUY %s x%d @ ₹%.2f | order_id=%s status=%s | SL=₹%s Targets=%s",
+            TAG_LIVE, signal.display_name, quantity, signal.entry_price,
             groww_order_id, order_status, signal.stoploss, signal.targets,
         )
 
@@ -314,9 +311,9 @@ class GrowwBroker(BrokerInterface):
             )
         except Exception:
             logger.exception(
-                "CRITICAL: BUY order %s placed on Groww but DB recording failed! "
+                "%s BUY order %s placed on Groww but DB recording failed! "
                 "Manual reconciliation needed.",
-                groww_order_id,
+                TAG_CRITICAL, groww_order_id,
             )
 
         # Place SL order if stoploss is provided
@@ -347,7 +344,7 @@ class GrowwBroker(BrokerInterface):
             "trigger_price": trigger_price,
             "product": product,
         }
-        logger.info("[GROWW REQ] place_order SL: %s", sl_params)
+        logger.info("%s place_order SL %s", TAG_GROWW_REQ, sl_params)
 
         try:
             response = await loop.run_in_executor(
@@ -364,16 +361,15 @@ class GrowwBroker(BrokerInterface):
                     trigger_price=trigger_price,
                 ),
             )
-            logger.info("[GROWW RES] place_order SL: %s", response)
+            logger.info("%s place_order SL → %s", TAG_GROWW_RES, response)
             logger.info(
-                "[LIVE] SL order placed for %s @ ₹%.2f — %s",
-                instrument["trading_symbol"],
-                trigger_price,
+                "%s SL placed for %s @ ₹%.2f | order_id=%s",
+                TAG_LIVE, instrument["trading_symbol"], trigger_price,
                 response.get("groww_order_id", ""),
             )
         except Exception:
             logger.exception(
-                "Failed to place SL order for %s", instrument["trading_symbol"]
+                "%s Failed to place SL order for %s", TAG_LIVE, instrument["trading_symbol"]
             )
 
     # ── Exit ─────────────────────────────────────────────────────────────
@@ -382,7 +378,7 @@ class GrowwBroker(BrokerInterface):
         try:
             await self._execute_exit_inner(signal, signal_id)
         except Exception:
-            logger.exception("[LIVE] Unhandled error in execute_exit for %s", signal.display_name)
+            logger.exception("%s Unhandled error in execute_exit for %s", TAG_LIVE, signal.display_name)
 
     async def _execute_exit_inner(self, signal: ExitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
@@ -397,7 +393,7 @@ class GrowwBroker(BrokerInterface):
                 signal.underlying
             )
             if not positions:
-                logger.warning("[LIVE] No open position for EXIT %s", signal.display_name)
+                logger.warning("%s No open position for EXIT %s", TAG_LIVE, signal.display_name)
                 return
             position = positions[0]
 
@@ -438,7 +434,7 @@ class GrowwBroker(BrokerInterface):
             "price": exit_price if order_type_str == "LIMIT" else "MARKET",
             "product": product,
         }
-        logger.info("[GROWW REQ] place_order EXIT: %s", exit_params)
+        logger.info("%s place_order EXIT %s", TAG_GROWW_REQ, exit_params)
 
         try:
             response = await loop.run_in_executor(
@@ -446,23 +442,20 @@ class GrowwBroker(BrokerInterface):
                 lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
-            logger.exception("[LIVE] Failed to place EXIT order for %s", position["trading_symbol"])
+            logger.exception("%s Failed to place EXIT order for %s", TAG_LIVE, position["trading_symbol"])
             return
 
-        logger.info("[GROWW RES] place_order EXIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
+        logger.info("%s place_order EXIT → %s", TAG_GROWW_RES, response)
 
         pnl = 0.0
         if exit_price is not None:
             pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
 
         logger.info(
-            "[LIVE] EXIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
-            position["trading_symbol"],
-            position["quantity"],
-            exit_price or "MARKET",
-            groww_order_id,
-            pnl,
+            "%s EXIT %s x%d @ ₹%s | order_id=%s | P&L: ₹%.2f",
+            TAG_LIVE, position["trading_symbol"], position["quantity"],
+            exit_price or "MARKET", groww_order_id, pnl,
         )
 
         try:
@@ -486,9 +479,9 @@ class GrowwBroker(BrokerInterface):
             await self._db.close_position(position["id"], pnl=pnl)
         except Exception:
             logger.exception(
-                "CRITICAL: EXIT order %s placed on Groww but DB recording failed! "
+                "%s EXIT order %s placed on Groww but DB recording failed! "
                 "Manual reconciliation needed.",
-                groww_order_id,
+                TAG_CRITICAL, groww_order_id,
             )
 
     # ── Book Profit ──────────────────────────────────────────────────────
@@ -497,7 +490,7 @@ class GrowwBroker(BrokerInterface):
         try:
             await self._execute_book_profit_inner(signal, signal_id)
         except Exception:
-            logger.exception("[LIVE] Unhandled error in execute_book_profit for %s", signal.display_name)
+            logger.exception("%s Unhandled error in execute_book_profit for %s", TAG_LIVE, signal.display_name)
 
     async def _execute_book_profit_inner(self, signal: BookProfitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
@@ -513,7 +506,7 @@ class GrowwBroker(BrokerInterface):
             )
             if not positions:
                 logger.warning(
-                    "[LIVE] No open position for BOOK_PROFIT %s", signal.display_name
+                    "%s No open position for BOOK_PROFIT %s", TAG_LIVE, signal.display_name
                 )
                 return
             position = positions[0]
@@ -580,7 +573,7 @@ class GrowwBroker(BrokerInterface):
             "product": product,
             "partial": signal.is_partial,
         }
-        logger.info("[GROWW REQ] place_order BOOK_PROFIT: %s", bp_params)
+        logger.info("%s place_order BOOK_PROFIT %s", TAG_GROWW_REQ, bp_params)
 
         try:
             response = await loop.run_in_executor(
@@ -589,13 +582,13 @@ class GrowwBroker(BrokerInterface):
             )
         except Exception:
             logger.exception(
-                "[LIVE] Failed to place BOOK_PROFIT order for %s",
-                position["trading_symbol"],
+                "%s Failed to place BOOK_PROFIT order for %s",
+                TAG_LIVE, position["trading_symbol"],
             )
             return
 
-        logger.info("[GROWW RES] place_order BOOK_PROFIT: %s", response)
         groww_order_id = response.get("groww_order_id", "")
+        logger.info("%s place_order BOOK_PROFIT → %s", TAG_GROWW_RES, response)
 
         pnl = 0.0
         if exit_price is not None:
@@ -629,20 +622,20 @@ class GrowwBroker(BrokerInterface):
                 await self._db.close_position(position["id"], pnl=pnl)
         except Exception:
             logger.exception(
-                "CRITICAL: BOOK_PROFIT order %s placed on Groww but DB recording "
+                "%s BOOK_PROFIT order %s placed on Groww but DB recording "
                 "failed! Manual reconciliation needed.",
-                groww_order_id,
+                TAG_CRITICAL, groww_order_id,
             )
 
         if remaining_qty > 0:
             logger.info(
-                "[LIVE] PARTIAL_BP %s  closed %d/%d @ ₹%s  order_id=%s  est_pnl=₹%.2f  remaining=%d",
-                position["trading_symbol"], close_qty, quantity,
+                "%s PARTIAL_BP %s | closed %d/%d @ ₹%s | order_id=%s | P&L: ₹%.2f | remaining=%d",
+                TAG_LIVE, position["trading_symbol"], close_qty, quantity,
                 exit_price or "MARKET", groww_order_id, pnl, remaining_qty,
             )
         else:
             logger.info(
-                "[LIVE] BOOK_PROFIT %s x%d @ ₹%s  order_id=%s  est_pnl=₹%.2f",
-                position["trading_symbol"], close_qty,
+                "%s BOOK_PROFIT %s x%d @ ₹%s | order_id=%s | P&L: ₹%.2f",
+                TAG_LIVE, position["trading_symbol"], close_qty,
                 exit_price or "MARKET", groww_order_id, pnl,
             )

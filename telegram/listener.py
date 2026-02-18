@@ -14,6 +14,8 @@ from parser.signal_parser import SignalParser
 from storage.db import Database
 from storage.daily_log import append_message
 
+from config.log_config import TAG_TELEGRAM, TAG_SIGNAL, TAG_UNPARSED, TAG_DB
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,28 +57,27 @@ class TelegramListener:
 
         # Fetch dialogs so Telethon caches the entity for the numeric group ID.
         # Without this, numeric IDs fail with "Could not find the input entity".
-        logger.info("Loading dialogs to resolve group entity …")
+        logger.info("%s Loading dialogs to resolve group entity …", TAG_TELEGRAM)
         await self._client.get_dialogs()
 
         me = await self._client.get_me()
         logger.info(
-            "Telegram listener started as %s (id=%s) — watching group %s",
-            me.first_name if me else "?",
-            me.id if me else "?",
-            self._settings.telegram_group_id,
+            "%s Listener started as %s (id=%s) — watching group %s",
+            TAG_TELEGRAM, me.first_name if me else "?",
+            me.id if me else "?", self._settings.telegram_group_id,
         )
 
     async def run_forever(self) -> None:
         """Block until the client disconnects."""
         if self._client is None:
             raise RuntimeError("Call start() before run_forever()")
-        logger.info("Listening for trade signals … (Ctrl+C to stop)")
+        logger.info("%s Listening for trade signals … (Ctrl+C to stop)", TAG_TELEGRAM)
         await self._client.run_until_disconnected()
 
     async def stop(self) -> None:
         if self._client:
             await self._client.disconnect()
-            logger.info("Telegram listener stopped")
+            logger.info("%s Listener stopped", TAG_TELEGRAM)
 
     # ── Event handler ────────────────────────────────────────────────────
 
@@ -114,7 +115,7 @@ class TelegramListener:
             text=text,
         )
 
-        logger.debug("New message [%d]: %s", msg_id, text[:120])
+        logger.debug("%s New message [%d]: %s", TAG_TELEGRAM, msg_id, text[:120])
 
         # Parse
         signal: Optional[TradeSignal] = self._parser.parse(
@@ -125,40 +126,32 @@ class TelegramListener:
             if len(preview) > 200:
                 preview = preview[:200] + "…"
             logger.warning(
-                "[UNPARSED] msg_id=%d | %s",
-                msg_id,
-                preview,
+                "%s msg_id=%d | %s",
+                TAG_UNPARSED, msg_id, preview,
             )
             return
 
         logger.info(
-            "Parsed %s signal: %s",
-            signal.signal_type.value,
-            signal.display_name,
+            "%s %s → %s",
+            TAG_SIGNAL, signal.signal_type.value, signal.display_name,
         )
 
-        # Idempotency check
         if await self._db.is_signal_processed(signal.signal_hash):
-            logger.info("Signal already processed (hash=%s), skipping", signal.signal_hash)
+            logger.info("%s Already processed (hash=%s), skipping", TAG_SIGNAL, signal.signal_hash)
             return
 
-        # Persist signal
         try:
             signal_id = await self._db.insert_signal(signal)
         except Exception:
-            logger.exception("Failed to insert signal into DB")
+            logger.exception("%s Failed to insert signal into DB", TAG_DB)
             return
 
-        # Execute via broker
         try:
             await self._broker.execute(signal, signal_id)
         except Exception:
-            logger.exception("Broker execution failed for signal %s", signal.signal_hash)
-            # Don't return — still mark as processed to avoid retrying a
-            # signal that might cause repeated failures.
+            logger.exception("%s Broker execution failed for signal %s", TAG_SIGNAL, signal.signal_hash)
 
-        # Mark processed
         try:
             await self._db.mark_signal_processed(signal.signal_hash)
         except Exception:
-            logger.exception("Failed to mark signal %s as processed", signal.signal_hash)
+            logger.exception("%s Failed to mark signal %s as processed", TAG_DB, signal.signal_hash)

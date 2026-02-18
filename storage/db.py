@@ -17,6 +17,8 @@ from parser.models import (
 )
 from storage.models import SCHEMA_SQL
 
+from config.log_config import TAG_DB
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,7 +35,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA_SQL)
         await self._conn.commit()
-        logger.info("Database connected: %s", self._db_path)
+        logger.info("%s Connected: %s", TAG_DB, self._db_path)
 
     async def close(self) -> None:
         if self._conn:

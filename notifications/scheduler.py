@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timezone, timedelta, time as dt_time
 
 from config.settings import Settings
+from config.log_config import TAG_SCHEDULER
 from notifications.daily_summary import generate_and_send_daily_summary
 from storage.db import Database
 
@@ -96,13 +97,13 @@ async def run_daily_summary_scheduler(
     can respond to shutdown within a few seconds.
     """
     if not settings.daily_summary_enabled:
-        logger.info("Daily summary is disabled — scheduler not started")
+        logger.info("%s Daily summary is disabled — scheduler not started", TAG_SCHEDULER)
         return
 
     target_time = _parse_time(settings.daily_summary_time)
     logger.info(
-        "Daily summary scheduler started — will fire at %s IST on market days",
-        settings.daily_summary_time,
+        "%s Started — will fire at %s IST on market days",
+        TAG_SCHEDULER, settings.daily_summary_time,
     )
 
     last_sent_date: str | None = None
@@ -115,7 +116,7 @@ async def run_daily_summary_scheduler(
         if last_sent_date == today_str:
             # Sleep until tomorrow's target time
             wait = _seconds_until(target_time)
-            logger.debug("Summary already sent today — sleeping %.0f seconds", wait)
+            logger.debug("%s Summary already sent today — sleeping %.0f seconds", TAG_SCHEDULER, wait)
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=min(wait, 60))
                 break
@@ -143,16 +144,16 @@ async def run_daily_summary_scheduler(
 
         # Time to fire!
         if not is_market_day():
-            logger.info("Not a market day (%s) — skipping daily summary", today_str)
+            logger.info("%s Not a market day (%s) — skipping daily summary", TAG_SCHEDULER, today_str)
             last_sent_date = today_str
             continue
 
-        logger.info("Firing daily summary for %s …", today_str)
+        logger.info("%s Firing daily summary for %s …", TAG_SCHEDULER, today_str)
         try:
             await generate_and_send_daily_summary(settings, db)
             last_sent_date = today_str
         except Exception:
-            logger.exception("Daily summary failed — will retry in 5 minutes")
+            logger.exception("%s Daily summary failed — will retry in 5 minutes", TAG_SCHEDULER)
             # Wait 5 minutes before retrying
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=300)
@@ -160,4 +161,4 @@ async def run_daily_summary_scheduler(
             except asyncio.TimeoutError:
                 continue
 
-    logger.info("Daily summary scheduler stopped")
+    logger.info("%s Stopped", TAG_SCHEDULER)
