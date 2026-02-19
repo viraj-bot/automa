@@ -134,7 +134,7 @@ class BacktestEngine:
         bp_with_price = 0
         bp_without_price = 0
 
-        _SEP = "─" * 80
+        _SEP = "=" * 80
         unparsed_count = 0
         for msg in messages:
             append_daily_log(
@@ -619,7 +619,16 @@ class BacktestEngine:
     async def _simulate_entry(
         self, signal: EntrySignal, signal_id: int, msg_time: datetime
     ) -> None:
+        groww_symbol = self._build_groww_symbol(
+            signal.underlying, signal.expiry_day, signal.expiry_month,
+            signal.strike_price, signal.option_type.value, msg_time,
+        )
+
         loop = asyncio.get_running_loop()
+        logger.info(
+            "%s Groww lookup: fetching historical price for %s at %s",
+            TAG_GROWW_REQ, groww_symbol, _to_ist_str(msg_time),
+        )
         hist_price = await loop.run_in_executor(
             None,
             lambda: self._get_historical_price(
@@ -631,11 +640,18 @@ class BacktestEngine:
         if hist_price is not None:
             fill_price = hist_price
             entry_source = "groww"
+            logger.info(
+                "%s Groww price found: ₹%.2f (signal price was ₹%.2f)",
+                TAG_GROWW_RES, hist_price, signal.entry_price,
+            )
         else:
             fill_price = signal.entry_price
             entry_source = "signal"
+            logger.info(
+                "%s Groww price not available — using signal price ₹%.2f",
+                TAG_GROWW_RES, signal.entry_price,
+            )
 
-        # Look up the real lot size from the instruments CSV
         lot_size = self._resolve_lot_size(
             signal.underlying, signal.expiry_day, signal.expiry_month,
             signal.strike_price, signal.option_type.value, msg_time,
@@ -663,7 +679,6 @@ class BacktestEngine:
             is_paper=True,
         )
 
-        # Remember the entry message time for the trade log (in IST)
         self._entry_times[ts] = _to_ist_str(msg_time)
 
         logger.info(
@@ -685,13 +700,24 @@ class BacktestEngine:
         entry_price = float(position["avg_entry_price"])
         quantity = int(position["quantity"])
 
-        # Prefer the explicit exit price from the signal (e.g. "at the current price ₹72.5")
         if signal.exit_price is not None:
             exit_price = float(signal.exit_price)
             exit_source = "signal"
+            logger.info(
+                "%s Exit price from signal: ₹%.2f (no Groww lookup needed)",
+                TAG_GROWW_RES, exit_price,
+            )
         else:
+            logger.info(
+                "%s No exit price in signal — resolving via Groww/fallback for %s",
+                TAG_GROWW_REQ, position["trading_symbol"],
+            )
             exit_price, exit_source = await self._resolve_exit_price(
                 position, msg_time, close_reason="EXIT",
+            )
+            logger.info(
+                "%s Exit price resolved: ₹%.2f (source: %s)",
+                TAG_GROWW_RES, exit_price, exit_source,
             )
 
         pnl = (exit_price - entry_price) * quantity
@@ -743,13 +769,24 @@ class BacktestEngine:
         entry_price = float(position["avg_entry_price"])
         quantity = int(position["quantity"])
 
-        # Book profit signals often include an explicit exit price
         if signal.exit_price is not None:
             exit_price = float(signal.exit_price)
-            exit_source = "signal"  # explicit price from the message
+            exit_source = "signal"
+            logger.info(
+                "%s Exit price from signal: ₹%.2f (no Groww lookup needed)",
+                TAG_GROWW_RES, exit_price,
+            )
         else:
+            logger.info(
+                "%s No exit price in signal — resolving via Groww/fallback for %s",
+                TAG_GROWW_REQ, position["trading_symbol"],
+            )
             exit_price, exit_source = await self._resolve_exit_price(
                 position, msg_time, close_reason="BOOK_PROFIT",
+            )
+            logger.info(
+                "%s Exit price resolved: ₹%.2f (source: %s)",
+                TAG_GROWW_RES, exit_price, exit_source,
             )
 
         # ── Handle partial vs full book-profit ──

@@ -115,7 +115,7 @@ class TelegramListener:
             text=text,
         )
 
-        _SEP = "─" * 80
+        _SEP = "=" * 80
         preview = text.replace("\n", " ").strip()
         if len(preview) > 200:
             preview = preview[:200] + "…"
