@@ -45,11 +45,13 @@ TAG_CRITICAL = "[CRITICAL]"
 # ── IST Formatter ────────────────────────────────────────────────────────────
 
 class ISTFormatter(logging.Formatter):
-    """Formats timestamps in IST regardless of system timezone."""
+    """Formats timestamps in IST regardless of system timezone, with ms precision."""
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         dt = datetime.fromtimestamp(record.created, tz=IST)
-        return dt.strftime(datefmt or "%d-%m-%Y %H:%M:%S")
+        base = dt.strftime(datefmt or "%d-%m-%Y %H:%M:%S")
+        ms = int(record.msecs)
+        return f"{base}.{ms:03d}"
 
 
 # ── Custom highlighter for trade-specific patterns ───────────────────────────
@@ -127,18 +129,15 @@ def setup_logging(level: str = "INFO", mode: str = "paper") -> None:
         rich_tracebacks=True,
         tracebacks_show_locals=False,
         markup=True,
-        show_time=True,
+        show_time=False,
         show_level=True,
         show_path=False,
         highlighter=_TradeHighlighter(),
-        log_time_format=_CONSOLE_DATEFMT,
     )
 
-    class _ISTRichFormatter(ISTFormatter):
-        """Overrides only the time portion; Rich handles the rest."""
-        pass
-
-    console_handler.setFormatter(_ISTRichFormatter(_CONSOLE_FMT, datefmt=_CONSOLE_DATEFMT))
+    console_handler.setFormatter(ISTFormatter(
+        "%(asctime)s  %(message)s", datefmt=_CONSOLE_DATEFMT,
+    ))
 
     handlers: list[logging.Handler] = [console_handler]
 

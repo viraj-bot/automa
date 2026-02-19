@@ -13,6 +13,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from config.settings import Settings
+from config.log_config import TAG_BT, TAG_GROWW_REQ, TAG_GROWW_RES, TAG_GROWW_ERR
 from parser.models import (
     BookProfitSignal,
     EntrySignal,
@@ -135,7 +136,6 @@ class BacktestEngine:
 
         unparsed_count = 0
         for msg in messages:
-            # Log every message to the backtest daily log
             append_daily_log(
                 mode="backtest",
                 msg_id=msg["id"],
@@ -143,21 +143,27 @@ class BacktestEngine:
                 text=msg["text"],
             )
 
+            msg_date_str = (
+                msg["date"].strftime("%Y-%m-%d %H:%M") if hasattr(msg["date"], "strftime") else str(msg["date"])
+            )
+            preview = msg["text"].replace("\n", " ").strip()
+            if len(preview) > 200:
+                preview = preview[:200] + "…"
+
             signal = self._parser.parse(
                 msg["text"],
                 message_id=msg["id"],
                 timestamp=msg["date"],
             )
+
             if signal is None:
-                # Log unparsed messages so we can improve the parser
-                preview = msg["text"].replace("\n", " ").strip()
-                if len(preview) > 200:
-                    preview = preview[:200] + "…"
+                logger.info(
+                    "%s Original message (msg_id=%s, %s): %s",
+                    TAG_BT, msg["id"], msg_date_str, preview,
+                )
                 logger.warning(
-                    "[UNPARSED] msg_id=%s date=%s | %s",
-                    msg["id"],
-                    msg["date"].strftime("%Y-%m-%d %H:%M") if hasattr(msg["date"], "strftime") else msg["date"],
-                    preview,
+                    "%s Parsing status: FAILED — could not parse signal from message",
+                    TAG_BT,
                 )
                 unparsed_count += 1
                 continue
@@ -166,47 +172,64 @@ class BacktestEngine:
             signal_id = await self._db.insert_signal(signal)
 
             try:
-                await self._process_signal(signal, signal_id, msg["date"])
                 if isinstance(signal, EntrySignal):
                     entry_count += 1
                     if signal.targets:
                         entries_with_targets += 1
                     else:
                         entries_without_targets += 1
-                    # Always log entry details for debugging
                     logger.info(
-                        "[BT] ENTRY %s | price=₹%.2f | SL=%s | targets=%s | raw: %s",
-                        signal.display_name, signal.entry_price,
+                        "%s Original message (msg_id=%s, %s): %s",
+                        TAG_BT, msg["id"], msg_date_str, preview,
+                    )
+                    logger.info(
+                        "%s Parsing status: OK — ENTRY %s | price=₹%.2f | SL=₹%s | targets=%s",
+                        TAG_BT, signal.display_name, signal.entry_price,
                         signal.stoploss, signal.targets,
-                        repr(signal.raw_text[:200]),
                     )
                 elif isinstance(signal, ExitSignal):
                     exit_count += 1
+                    logger.info(
+                        "%s Original message (msg_id=%s, %s): %s",
+                        TAG_BT, msg["id"], msg_date_str, preview,
+                    )
+                    logger.info(
+                        "%s Parsing status: OK — EXIT %s | exit_price=₹%s",
+                        TAG_BT, signal.display_name, signal.exit_price,
+                    )
                 elif isinstance(signal, BookProfitSignal):
                     bp_count += 1
                     if signal.exit_price is not None:
                         bp_with_price += 1
                     else:
                         bp_without_price += 1
+                    logger.info(
+                        "%s Original message (msg_id=%s, %s): %s",
+                        TAG_BT, msg["id"], msg_date_str, preview,
+                    )
+                    logger.info(
+                        "%s Parsing status: OK — BOOK_PROFIT %s | exit_price=₹%s | partial=%s",
+                        TAG_BT, signal.display_name, signal.exit_price, signal.is_partial,
+                    )
+
+                await self._process_signal(signal, signal_id, msg["date"])
             except Exception:
-                logger.exception("Error processing signal")
+                logger.exception("%s Error processing signal for msg_id=%s", TAG_BT, msg["id"])
                 errors += 1
 
         # 4. Log open positions before force-closing (diagnostic)
         pre_close_open = await self._db.get_all_positions(status="OPEN")
         if pre_close_open:
             logger.info(
-                "[BT] %d positions still open before force-close:",
-                len(pre_close_open),
+                "%s %d positions still open before force-close:",
+                TAG_BT, len(pre_close_open),
             )
             for p in pre_close_open:
                 logger.info(
-                    "  -> id=%s underlying=%r ts=%s strike=%s otype=%s "
-                    "day=%s month=%s entry=₹%.2f targets=%s sl=%s",
-                    p["id"], p["underlying"], p["trading_symbol"],
+                    "%s   -> id=%s %s(%s) | strike=%s %s | entry=₹%.2f | SL=₹%s targets=%s",
+                    TAG_BT, p["id"], p["underlying"], p["trading_symbol"],
                     p.get("strike_price"), p.get("option_type"),
-                    p.get("expiry_day"), p.get("expiry_month"),
-                    p["avg_entry_price"], p.get("targets"), p.get("stoploss"),
+                    p["avg_entry_price"], p.get("stoploss"), p.get("targets"),
                 )
 
         # Force-close orphaned open positions at stoploss or entry price
@@ -290,8 +313,8 @@ class BacktestEngine:
             tmp_api = GrowwAPI(self._settings.groww_api_token)
             self._instruments_df = tmp_api.get_all_instruments()
             logger.info(
-                "Loaded %d instruments from Groww",
-                len(self._instruments_df),
+                "%s Loaded %d instruments from Groww",
+                TAG_GROWW_RES, len(self._instruments_df),
             )
 
             # Build lot-size cache by underlying symbol
@@ -307,10 +330,8 @@ class BacktestEngine:
                         cache[sym] = lot
                 self._lot_size_cache = cache
                 logger.info(
-                    "Built lot-size cache for %d underlyings (e.g. NIFTY=%s, BANKNIFTY=%s)",
-                    len(cache),
-                    cache.get("NIFTY", "?"),
-                    cache.get("BANKNIFTY", "?"),
+                    "%s Built lot-size cache for %d underlyings (e.g. NIFTY=%s, BANKNIFTY=%s)",
+                    TAG_BT, len(cache), cache.get("NIFTY", "?"), cache.get("BANKNIFTY", "?"),
                 )
         except Exception:
             logger.warning(
@@ -325,7 +346,7 @@ class BacktestEngine:
                 secret=self._settings.groww_api_secret,
             )
             self._groww = GrowwAPI(access_token)
-            logger.info("Groww API authenticated — historical candle data available")
+            logger.info("%s Groww API authenticated — historical candle data available", TAG_GROWW_RES)
         except Exception:
             logger.warning(
                 "Could not obtain Groww access token — backtest will use signal "
@@ -425,7 +446,7 @@ class BacktestEngine:
             return lot
 
         logger.warning(
-            "[BT] Lot size not found for %s, defaulting to 1", underlying,
+            "%s Lot size not found for %s, defaulting to 1", TAG_BT, underlying,
         )
         return 1
 
@@ -503,8 +524,8 @@ class BacktestEngine:
             return price
 
         logger.warning(
-            "[GROWW] No candle data for %s at %s (tried 3 strategies)",
-            groww_symbol, at_time.strftime("%Y-%m-%d %H:%M"),
+            "%s No candle data for %s at %s (tried 3 strategies)",
+            TAG_GROWW_ERR, groww_symbol, at_time.strftime("%Y-%m-%d %H:%M"),
         )
         return None
 
@@ -533,8 +554,8 @@ class BacktestEngine:
         end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         logger.debug(
-            "[GROWW REQ] candles %s  %s → %s  interval=%s",
-            groww_symbol, start_str, end_str, interval,
+            "%s candles %s  %s → %s  interval=%s",
+            TAG_GROWW_REQ, groww_symbol, start_str, end_str, interval,
         )
 
         try:
@@ -548,7 +569,7 @@ class BacktestEngine:
             )
             candles = data.get("candles", [])
             logger.debug(
-                "[GROWW RES] %s: %d candles returned", groww_symbol, len(candles),
+                "%s %s: %d candles returned", TAG_GROWW_RES, groww_symbol, len(candles),
             )
 
             if not candles:
@@ -579,14 +600,14 @@ class BacktestEngine:
             if best_candle is not None:
                 price = float(best_candle[4])  # close price
                 logger.debug(
-                    "[GROWW] %s nearest candle close=₹%.2f (%.0fs from signal)",
-                    groww_symbol, price, best_diff,
+                    "%s %s nearest candle close=₹%.2f (%.0fs from signal)",
+                    TAG_GROWW_RES, groww_symbol, price, best_diff,
                 )
                 return price
 
         except Exception as exc:
             logger.debug(
-                "[GROWW ERR] candles %s: %s", groww_symbol, exc,
+                "%s candles %s: %s", TAG_GROWW_ERR, groww_symbol, exc,
             )
 
         return None
@@ -655,8 +676,8 @@ class BacktestEngine:
         self._entry_times[ts] = _to_ist_str(msg_time)
 
         logger.info(
-            "[BT] ENTRY %s x%d @ ₹%.2f (%s) | signal=₹%.2f SL=%s T=%s",
-            signal.display_name, quantity, fill_price, entry_source,
+            "%s ENTRY %s x%d @ ₹%.2f (%s) | signal=₹%.2f SL=₹%s T=%s",
+            TAG_BT, signal.display_name, quantity, fill_price, entry_source,
             signal.entry_price, signal.stoploss, signal.targets,
         )
 
@@ -665,7 +686,7 @@ class BacktestEngine:
     ) -> None:
         position = await self._find_matching_position(signal)
         if position is None:
-            logger.warning("[BT] No open position for EXIT %s", signal.display_name)
+            logger.warning("%s No open position for EXIT %s", TAG_BT, signal.display_name)
             self._unmatched_close_signals += 1
             self._unmatched_exit_signals += 1
             return
@@ -704,8 +725,8 @@ class BacktestEngine:
         })
 
         logger.info(
-            "[BT] EXIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
-            position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
+            "%s EXIT %s | entry=₹%.2f → exit=₹%.2f (%s) | P&L: ₹%.2f",
+            TAG_BT, position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
         )
 
     async def _simulate_book_profit(
@@ -721,8 +742,8 @@ class BacktestEngine:
                 if updated:
                     return
             logger.warning(
-                "[BT] No open position for BOOK_PROFIT %s (exit_price=₹%s)",
-                signal.display_name, signal.exit_price,
+                "%s No open position for BOOK_PROFIT %s (exit_price=₹%s)",
+                TAG_BT, signal.display_name, signal.exit_price,
             )
             self._unmatched_close_signals += 1
             self._unmatched_bp_signals += 1
@@ -798,8 +819,8 @@ class BacktestEngine:
             })
 
             logger.info(
-                "[BT] PARTIAL_BP %s  closed %d/%d @ ₹%.2f (%s)  P&L=₹%.2f  remaining=%d",
-                position["trading_symbol"], close_qty, quantity,
+                "%s PARTIAL_BP %s | closed %d/%d @ ₹%.2f (%s) | P&L: ₹%.2f | remaining=%d",
+                TAG_BT, position["trading_symbol"], close_qty, quantity,
                 exit_price, exit_source, partial_pnl, remaining_qty,
             )
         else:
@@ -826,8 +847,8 @@ class BacktestEngine:
             })
 
             logger.info(
-                "[BT] BOOK_PROFIT %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
-                position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
+                "%s BOOK_PROFIT %s | entry=₹%.2f → exit=₹%.2f (%s) | P&L: ₹%.2f",
+                TAG_BT, position["trading_symbol"], entry_price, exit_price, exit_source, pnl,
             )
 
     async def _update_closed_position_pnl(
@@ -872,8 +893,8 @@ class BacktestEngine:
         original_source = matching_trade.get("exit_source", "")
         if original_source in ("signal", "groww"):
             logger.debug(
-                "[BT] SKIP update for %s — already closed at real %s price ₹%.2f",
-                closed_pos["trading_symbol"], original_source,
+                "%s SKIP update for %s — already closed at real %s price ₹%.2f",
+                TAG_BT, closed_pos["trading_symbol"], original_source,
                 matching_trade["exit_price"],
             )
             return True  # Return True to suppress the "unmatched" warning
@@ -894,10 +915,9 @@ class BacktestEngine:
         matching_trade["close_type"] = "BOOK_PROFIT"
         matching_trade["pnl"] = new_pnl
         logger.info(
-            "[BT] UPDATED %s: exit ₹%.2f→₹%.2f (%s→signal) P&L ₹%.2f→₹%.2f",
-            closed_pos["trading_symbol"],
-            old_exit, new_exit, old_source,
-            old_pnl, new_pnl,
+            "%s UPDATED %s: exit ₹%.2f→₹%.2f (%s→signal) | P&L: ₹%.2f→₹%.2f",
+            TAG_BT, closed_pos["trading_symbol"],
+            old_exit, new_exit, old_source, old_pnl, new_pnl,
         )
         return True
 
@@ -928,8 +948,8 @@ class BacktestEngine:
         )
         if position is not None:
             logger.debug(
-                "[BT] MATCH (exact) for %s: pos_id=%s ts=%s",
-                signal.display_name, position["id"], position["trading_symbol"],
+                "%s MATCH (exact) for %s: pos_id=%s ts=%s",
+                TAG_BT, signal.display_name, position["id"], position["trading_symbol"],
             )
             return position
 
@@ -942,8 +962,8 @@ class BacktestEngine:
             )
             if position is not None:
                 logger.debug(
-                    "[BT] MATCH (strike+otype) for %s: pos_id=%s ts=%s",
-                    signal.display_name, position["id"], position["trading_symbol"],
+                    "%s MATCH (strike+otype) for %s: pos_id=%s ts=%s",
+                    TAG_BT, signal.display_name, position["id"], position["trading_symbol"],
                 )
                 return position
 
@@ -955,8 +975,8 @@ class BacktestEngine:
             )
             if position is not None:
                 logger.debug(
-                    "[BT] MATCH (underlying+otype) for %s: pos_id=%s ts=%s",
-                    signal.display_name, position["id"], position["trading_symbol"],
+                    "%s MATCH (underlying+otype) for %s: pos_id=%s ts=%s",
+                    TAG_BT, signal.display_name, position["id"], position["trading_symbol"],
                 )
                 return position
 
@@ -964,8 +984,8 @@ class BacktestEngine:
         positions = await self._db.find_all_open_positions_for_underlying(sig_underlying)
         if positions:
             logger.debug(
-                "[BT] MATCH (underlying only) for %s: pos_id=%s ts=%s",
-                signal.display_name, positions[0]["id"], positions[0]["trading_symbol"],
+                "%s MATCH (underlying only) for %s: pos_id=%s ts=%s",
+                TAG_BT, signal.display_name, positions[0]["id"], positions[0]["trading_symbol"],
             )
             return positions[0]
 
@@ -976,15 +996,15 @@ class BacktestEngine:
                 f"{p['underlying']}({p['trading_symbol']})" for p in all_open
             ]
             logger.warning(
-                "[BT] NO MATCH for %s (underlying=%r strike=%s otype=%s day=%s month=%s). "
+                "%s NO MATCH for %s (underlying=%r strike=%s otype=%s day=%s month=%s). "
                 "Open positions: %s",
-                signal.display_name, sig_underlying, sig_strike, sig_otype,
+                TAG_BT, signal.display_name, sig_underlying, sig_strike, sig_otype,
                 sig_day, sig_month, ", ".join(open_underlyings),
             )
         else:
             logger.warning(
-                "[BT] NO MATCH for %s — no open positions at all",
-                signal.display_name,
+                "%s NO MATCH for %s — no open positions at all",
+                TAG_BT, signal.display_name,
             )
         return None
 
@@ -1041,8 +1061,8 @@ class BacktestEngine:
             # Use target as best estimate.
             if first_target is not None:
                 logger.info(
-                    "[BT] Exit %s (BOOK_PROFIT): target ₹%.2f (no Groww data)",
-                    ts, first_target,
+                    "%s Exit %s (BOOK_PROFIT): target ₹%.2f (no Groww data)",
+                    TAG_BT, ts, first_target,
                 )
                 return first_target, "target"
 
@@ -1054,9 +1074,9 @@ class BacktestEngine:
             #  will correct the P&L with the real exit price.)
             if stoploss_val is not None:
                 logger.info(
-                    "[BT] Exit %s (EXIT): stoploss ₹%.2f (no Groww data, "
+                    "%s Exit %s (EXIT): stoploss ₹%.2f (no Groww data, "
                     "assuming loss — will be corrected if book-profit follows)",
-                    ts, stoploss_val,
+                    TAG_BT, ts, stoploss_val,
                 )
                 return stoploss_val, "stoploss"
 
@@ -1064,14 +1084,14 @@ class BacktestEngine:
             # ORPHAN — assume worst case
             if stoploss_val is not None:
                 logger.info(
-                    "[BT] Exit %s (ORPHAN): stoploss ₹%.2f",
-                    ts, stoploss_val,
+                    "%s Exit %s (ORPHAN): stoploss ₹%.2f",
+                    TAG_BT, ts, stoploss_val,
                 )
                 return stoploss_val, "stoploss"
 
         logger.warning(
-            "[BT] Exit %s (%s): entry ₹%.2f (no data at all)",
-            ts, close_reason, entry,
+            "%s Exit %s (%s): entry ₹%.2f (no data at all)",
+            TAG_BT, ts, close_reason, entry,
         )
         return entry, "entry"
 
@@ -1082,8 +1102,8 @@ class BacktestEngine:
             return
 
         logger.info(
-            "Force-closing %d orphaned positions (no exit signal received)",
-            len(open_positions),
+            "%s Force-closing %d orphaned positions (no exit signal received)",
+            TAG_BT, len(open_positions),
         )
 
         for pos in open_positions:
@@ -1119,6 +1139,6 @@ class BacktestEngine:
             })
 
             logger.info(
-                "[BT] FORCE-CLOSE %s  entry=₹%.2f  exit=₹%.2f (%s)  P&L=₹%.2f",
-                pos["trading_symbol"], entry, exit_price, exit_source, pnl,
+                "%s FORCE-CLOSE %s | entry=₹%.2f → exit=₹%.2f (%s) | P&L: ₹%.2f",
+                TAG_BT, pos["trading_symbol"], entry, exit_price, exit_source, pnl,
             )
