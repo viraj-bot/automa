@@ -115,24 +115,26 @@ class TelegramListener:
             text=text,
         )
 
-        logger.debug("%s New message [%d]: %s", TAG_TELEGRAM, msg_id, text[:120])
+        _SEP = "─" * 80
+        preview = text.replace("\n", " ").strip()
+        if len(preview) > 200:
+            preview = preview[:200] + "…"
 
-        # Parse
+        logger.info(_SEP)
+        logger.info("%s Original message: %s", TAG_TELEGRAM, preview)
+
         signal: Optional[TradeSignal] = self._parser.parse(
             text, message_id=msg_id, timestamp=timestamp
         )
         if signal is None:
-            preview = text.replace("\n", " ").strip()
-            if len(preview) > 200:
-                preview = preview[:200] + "…"
             logger.warning(
-                "%s msg_id=%d | %s",
-                TAG_UNPARSED, msg_id, preview,
+                "%s Parsing status: FAILED — could not parse signal from message",
+                TAG_UNPARSED,
             )
             return
 
         logger.info(
-            "%s %s → %s",
+            "%s Parsing status: OK — %s → %s",
             TAG_SIGNAL, signal.signal_type.value, signal.display_name,
         )
 

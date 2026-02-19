@@ -134,6 +134,7 @@ class BacktestEngine:
         bp_with_price = 0
         bp_without_price = 0
 
+        _SEP = "─" * 80
         unparsed_count = 0
         for msg in messages:
             append_daily_log(
@@ -156,11 +157,13 @@ class BacktestEngine:
                 timestamp=msg["date"],
             )
 
+            logger.info(_SEP)
+            logger.info(
+                "%s Original message (%s): %s",
+                TAG_BT, msg_date_str, preview,
+            )
+
             if signal is None:
-                logger.info(
-                    "%s Original message (msg_id=%s, %s): %s",
-                    TAG_BT, msg["id"], msg_date_str, preview,
-                )
                 logger.warning(
                     "%s Parsing status: FAILED — could not parse signal from message",
                     TAG_BT,
@@ -179,20 +182,12 @@ class BacktestEngine:
                     else:
                         entries_without_targets += 1
                     logger.info(
-                        "%s Original message (msg_id=%s, %s): %s",
-                        TAG_BT, msg["id"], msg_date_str, preview,
-                    )
-                    logger.info(
                         "%s Parsing status: OK — ENTRY %s | price=₹%.2f | SL=₹%s | targets=%s",
                         TAG_BT, signal.display_name, signal.entry_price,
                         signal.stoploss, signal.targets,
                     )
                 elif isinstance(signal, ExitSignal):
                     exit_count += 1
-                    logger.info(
-                        "%s Original message (msg_id=%s, %s): %s",
-                        TAG_BT, msg["id"], msg_date_str, preview,
-                    )
                     logger.info(
                         "%s Parsing status: OK — EXIT %s | exit_price=₹%s",
                         TAG_BT, signal.display_name, signal.exit_price,
@@ -204,17 +199,13 @@ class BacktestEngine:
                     else:
                         bp_without_price += 1
                     logger.info(
-                        "%s Original message (msg_id=%s, %s): %s",
-                        TAG_BT, msg["id"], msg_date_str, preview,
-                    )
-                    logger.info(
                         "%s Parsing status: OK — BOOK_PROFIT %s | exit_price=₹%s | partial=%s",
                         TAG_BT, signal.display_name, signal.exit_price, signal.is_partial,
                     )
 
                 await self._process_signal(signal, signal_id, msg["date"])
             except Exception:
-                logger.exception("%s Error processing signal for msg_id=%s", TAG_BT, msg["id"])
+                logger.exception("%s Error processing signal", TAG_BT)
                 errors += 1
 
         # 4. Log open positions before force-closing (diagnostic)
