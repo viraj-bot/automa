@@ -257,15 +257,23 @@ class GrowwBroker(BrokerInterface):
         lot_size = max(instrument.get("lot_size", 1), 1)
         quantity = lot_size * self._settings.default_lot_multiplier
 
-        # Risk check
-        if signal.stoploss is not None:
-            risk = (signal.entry_price - signal.stoploss) * quantity
-            if risk > self._settings.max_risk_per_trade:
-                logger.warning(
-                    "%s SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
-                    TAG_RISK, signal.display_name, risk, self._settings.max_risk_per_trade,
-                )
-                return
+        stoploss = signal.stoploss
+        if stoploss is None:
+            stoploss = round(
+                signal.entry_price * (1 - self._settings.default_sl_percent / 100), 2
+            )
+            logger.warning(
+                "%s No SL in signal for %s — applying default %g%% SL @ ₹%.2f",
+                TAG_RISK, signal.display_name, self._settings.default_sl_percent, stoploss,
+            )
+
+        risk = (signal.entry_price - stoploss) * quantity
+        if risk > self._settings.max_risk_per_trade:
+            logger.warning(
+                "%s SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
+                TAG_RISK, signal.display_name, risk, self._settings.max_risk_per_trade,
+            )
+            return
 
         product = self._settings.default_product.value  # NRML or MIS
         use_market = self._settings.entry_order_type.value == "MARKET"
@@ -295,7 +303,7 @@ class GrowwBroker(BrokerInterface):
             "transaction_type": "BUY",
             "price": signal.entry_price if not use_market else "MARKET",
             "product": product,
-            "stoploss": signal.stoploss,
+            "stoploss": stoploss,
             "targets": signal.targets,
         }
         logger.info("%s place_order BUY %s", TAG_GROWW_REQ, order_params)
@@ -312,9 +320,9 @@ class GrowwBroker(BrokerInterface):
         order_status = response.get("order_status", "UNKNOWN")
         logger.info("%s place_order BUY → %s", TAG_GROWW_RES, response)
         logger.info(
-            "%s BUY %s x%d @ ₹%.2f | order_id=%s status=%s | SL=₹%s Targets=%s",
+            "%s BUY %s x%d @ ₹%.2f | order_id=%s status=%s | SL=₹%.2f Targets=%s",
             TAG_LIVE, signal.display_name, quantity, signal.entry_price,
-            groww_order_id, order_status, signal.stoploss, signal.targets,
+            groww_order_id, order_status, stoploss, signal.targets,
         )
 
         # Record in DB — if this fails, the order is live on Groww but
@@ -352,7 +360,7 @@ class GrowwBroker(BrokerInterface):
                 strike_price=signal.strike_price,
                 expiry_day=signal.expiry_day,
                 expiry_month=signal.expiry_month,
-                stoploss=signal.stoploss,
+                stoploss=stoploss,
                 targets=signal.targets,
                 is_paper=False,
             )
@@ -363,15 +371,13 @@ class GrowwBroker(BrokerInterface):
                 TAG_CRITICAL, groww_order_id,
             )
 
-        # Place SL order if stoploss is provided
-        if signal.stoploss is not None:
-            await self._place_stoploss(
-                instrument=instrument,
-                quantity=quantity,
-                trigger_price=signal.stoploss,
-                signal_id=signal_id,
-                product=product,
-            )
+        await self._place_stoploss(
+            instrument=instrument,
+            quantity=quantity,
+            trigger_price=stoploss,
+            signal_id=signal_id,
+            product=product,
+        )
 
     async def _place_stoploss(
         self,

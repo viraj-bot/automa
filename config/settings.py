@@ -91,6 +91,12 @@ class Settings(BaseSettings):
         default=OrderPlacement.MARKET,
         description="Order type for exits: LIMIT (signal price) or MARKET (current price)",
     )
+    default_sl_percent: float = Field(
+        default=30.0,
+        gt=0,
+        le=100,
+        description="Default stoploss as % below entry price, used when the signal has no SL",
+    )
 
     # ── Database ──
     database_path: str = Field(

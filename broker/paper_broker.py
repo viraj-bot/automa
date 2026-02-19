@@ -155,15 +155,23 @@ class PaperBroker(BrokerInterface):
         lot_size = max(instrument.get("lot_size", 1), 1)
         quantity = lot_size * self._settings.default_lot_multiplier
 
-        # Risk check
-        if signal.stoploss is not None:
-            risk = (signal.entry_price - signal.stoploss) * quantity
-            if risk > self._settings.max_risk_per_trade:
-                logger.warning(
-                    "%s SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
-                    TAG_RISK, signal.display_name, risk, self._settings.max_risk_per_trade,
-                )
-                return
+        stoploss = signal.stoploss
+        if stoploss is None:
+            stoploss = round(
+                signal.entry_price * (1 - self._settings.default_sl_percent / 100), 2
+            )
+            logger.warning(
+                "%s No SL in signal for %s — applying default %g%% SL @ ₹%.2f",
+                TAG_RISK, signal.display_name, self._settings.default_sl_percent, stoploss,
+            )
+
+        risk = (signal.entry_price - stoploss) * quantity
+        if risk > self._settings.max_risk_per_trade:
+            logger.warning(
+                "%s SKIP %s — risk ₹%.0f exceeds max ₹%.0f",
+                TAG_RISK, signal.display_name, risk, self._settings.max_risk_per_trade,
+            )
+            return
 
         order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
         entry_order_type = self._settings.entry_order_type.value
@@ -200,15 +208,15 @@ class PaperBroker(BrokerInterface):
             strike_price=signal.strike_price,
             expiry_day=signal.expiry_day,
             expiry_month=signal.expiry_month,
-            stoploss=signal.stoploss,
+            stoploss=stoploss,
             targets=signal.targets,
             is_paper=True,
         )
 
         logger.info(
-            "%s BUY %s x%d @ ₹%.2f | SL=₹%s Targets=%s",
+            "%s BUY %s x%d @ ₹%.2f | SL=₹%.2f Targets=%s",
             TAG_PAPER, signal.display_name, quantity, signal.entry_price,
-            signal.stoploss, signal.targets,
+            stoploss, signal.targets,
         )
 
     # ── Exit ─────────────────────────────────────────────────────────────
