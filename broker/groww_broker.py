@@ -18,7 +18,7 @@ from parser.models import BookProfitSignal, EntrySignal, ExitSignal
 from storage.db import Database
 
 from config.log_config import (
-    TAG_GROWW_REQ, TAG_GROWW_RES, TAG_LIVE, TAG_RISK, TAG_CRITICAL,
+    TAG_GROWW_REQ, TAG_GROWW_RES, TAG_GROWW_ERR, TAG_LIVE, TAG_RISK, TAG_CRITICAL,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,51 @@ class GrowwBroker(BrokerInterface):
             logger.warning("%s Access token expired — re-authenticating …", TAG_GROWW_REQ)
             await self._reauthenticate()
             return await loop.run_in_executor(None, func)
+
+    _TERMINAL_STATUSES = frozenset({
+        "EXECUTED", "REJECTED", "CANCELLED", "FAILED", "COMPLETED",
+    })
+
+    async def _verify_order(
+        self,
+        groww_order_id: str,
+        segment: str = "FNO",
+        label: str = "order",
+        max_polls: int = 5,
+        poll_interval: float = 1.0,
+    ) -> dict:
+        """Poll ``get_order_status`` until the order reaches a terminal state.
+
+        Returns the final status response dict.  If polling exhausts
+        *max_polls* without a terminal state, returns the last response
+        with a warning.
+        """
+        last_resp: dict = {}
+        for attempt in range(1, max_polls + 1):
+            await asyncio.sleep(poll_interval)
+            try:
+                last_resp = await self._call_groww_api(
+                    lambda: self.groww.get_order_status(
+                        segment=segment,
+                        groww_order_id=groww_order_id,
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "%s Could not fetch status for %s %s (attempt %d/%d)",
+                    TAG_GROWW_ERR, label, groww_order_id, attempt, max_polls,
+                )
+                continue
+
+            status = last_resp.get("order_status", "UNKNOWN")
+            if status in self._TERMINAL_STATUSES:
+                return last_resp
+
+        logger.warning(
+            "%s %s %s still non-terminal after %d polls — last: %s",
+            TAG_GROWW_ERR, label, groww_order_id, max_polls, last_resp,
+        )
+        return last_resp
 
     # ── Instrument resolution ────────────────────────────────────────────
 
@@ -319,14 +364,29 @@ class GrowwBroker(BrokerInterface):
         groww_order_id = response.get("groww_order_id", "")
         order_status = response.get("order_status", "UNKNOWN")
         logger.info("%s place_order BUY → %s", TAG_GROWW_RES, response)
+
+        # Verify the order actually went through
+        verified = await self._verify_order(
+            groww_order_id, segment="FNO", label="BUY",
+        )
+        final_status = verified.get("order_status", order_status)
+        fill_price = verified.get("avg_fill_price") or verified.get("price") or signal.entry_price
+        filled_qty = verified.get("filled_quantity", 0)
+
+        if final_status in ("REJECTED", "CANCELLED", "FAILED"):
+            reason = verified.get("rejection_reason") or verified.get("remark") or "unknown"
+            logger.error(
+                "%s BUY %s REJECTED — %s | order_id=%s",
+                TAG_GROWW_ERR, signal.display_name, reason, groww_order_id,
+            )
+            return
+
         logger.info(
             "%s BUY %s x%d @ ₹%.2f | order_id=%s status=%s | SL=₹%.2f Targets=%s",
             TAG_LIVE, signal.display_name, quantity, signal.entry_price,
-            groww_order_id, order_status, stoploss, signal.targets,
+            groww_order_id, final_status, stoploss, signal.targets,
         )
 
-        # Record in DB — if this fails, the order is live on Groww but
-        # unrecorded locally.  Log critically but don't crash.
         try:
             order_id = await self._db.insert_order(
                 signal_id=signal_id,
@@ -345,8 +405,9 @@ class GrowwBroker(BrokerInterface):
 
             await self._db.update_order_status(
                 order_id=order_id,
-                status=order_status,
-                filled_qty=0,
+                status=final_status,
+                filled_qty=filled_qty,
+                avg_fill_price=float(fill_price) if fill_price else None,
             )
 
             await self._db.open_position(
@@ -355,7 +416,7 @@ class GrowwBroker(BrokerInterface):
                 trading_symbol=instrument["trading_symbol"],
                 groww_symbol=instrument["groww_symbol"],
                 quantity=quantity,
-                avg_entry_price=signal.entry_price,
+                avg_entry_price=float(fill_price) if fill_price else signal.entry_price,
                 option_type=signal.option_type.value,
                 strike_price=signal.strike_price,
                 expiry_day=signal.expiry_day,
@@ -412,15 +473,32 @@ class GrowwBroker(BrokerInterface):
                     trigger_price=trigger_price,
                 ),
             )
+            sl_order_id = response.get("groww_order_id", "")
             logger.info("%s place_order SL → %s", TAG_GROWW_RES, response)
-            logger.info(
-                "%s SL placed for %s @ ₹%.2f | order_id=%s",
-                TAG_LIVE, instrument["trading_symbol"], trigger_price,
-                response.get("groww_order_id", ""),
+
+            verified = await self._verify_order(
+                sl_order_id, segment="FNO", label="SL",
             )
+            sl_status = verified.get("order_status", "UNKNOWN")
+
+            if sl_status in ("REJECTED", "CANCELLED", "FAILED"):
+                reason = verified.get("rejection_reason") or verified.get("remark") or "unknown"
+                logger.error(
+                    "%s SL order REJECTED for %s — %s | "
+                    "POSITION IS UNPROTECTED! Place SL manually.",
+                    TAG_CRITICAL, instrument["trading_symbol"], reason,
+                )
+            else:
+                logger.info(
+                    "%s SL placed for %s @ ₹%.2f | order_id=%s status=%s",
+                    TAG_LIVE, instrument["trading_symbol"], trigger_price,
+                    sl_order_id, sl_status,
+                )
         except Exception:
             logger.exception(
-                "%s Failed to place SL order for %s", TAG_LIVE, instrument["trading_symbol"]
+                "%s Failed to place SL order for %s — "
+                "POSITION IS UNPROTECTED! Place SL manually.",
+                TAG_CRITICAL, instrument["trading_symbol"],
             )
 
     # ── Exit ─────────────────────────────────────────────────────────────
@@ -493,14 +571,30 @@ class GrowwBroker(BrokerInterface):
         groww_order_id = response.get("groww_order_id", "")
         logger.info("%s place_order EXIT → %s", TAG_GROWW_RES, response)
 
+        verified = await self._verify_order(
+            groww_order_id, segment="FNO", label="EXIT",
+        )
+        final_status = verified.get("order_status", "UNKNOWN")
+        actual_fill_price = verified.get("avg_fill_price") or exit_price
+
+        if final_status in ("REJECTED", "CANCELLED", "FAILED"):
+            reason = verified.get("rejection_reason") or verified.get("remark") or "unknown"
+            logger.error(
+                "%s EXIT %s REJECTED — %s | order_id=%s | "
+                "Position is still open! Exit manually.",
+                TAG_CRITICAL, position["trading_symbol"], reason, groww_order_id,
+            )
+            return
+
         pnl = 0.0
-        if exit_price is not None:
-            pnl = (exit_price - position["avg_entry_price"]) * position["quantity"]
+        sell_price = float(actual_fill_price) if actual_fill_price else exit_price
+        if sell_price is not None:
+            pnl = (sell_price - position["avg_entry_price"]) * position["quantity"]
 
         logger.info(
-            "%s EXIT %s x%d @ ₹%s | order_id=%s | P&L: ₹%.2f",
+            "%s EXIT %s x%d @ ₹%s | order_id=%s status=%s | P&L: ₹%.2f",
             TAG_LIVE, position["trading_symbol"], position["quantity"],
-            exit_price or "MARKET", groww_order_id, pnl,
+            sell_price or "MARKET", groww_order_id, final_status, pnl,
         )
 
         try:
@@ -511,14 +605,14 @@ class GrowwBroker(BrokerInterface):
                 transaction_type="SELL",
                 order_type=order_type_str,
                 quantity=position["quantity"],
-                price=exit_price,
+                price=sell_price,
                 order_ref=groww_order_id,
                 is_paper=False,
             )
 
             await self._db.update_order_status(
                 order_id=order_id,
-                status=response.get("order_status", "OPEN"),
+                status=final_status,
             )
 
             await self._db.close_position(position["id"], pnl=pnl)
@@ -633,9 +727,25 @@ class GrowwBroker(BrokerInterface):
         groww_order_id = response.get("groww_order_id", "")
         logger.info("%s place_order BOOK_PROFIT → %s", TAG_GROWW_RES, response)
 
+        verified = await self._verify_order(
+            groww_order_id, segment="FNO", label="BOOK_PROFIT",
+        )
+        final_status = verified.get("order_status", "UNKNOWN")
+        actual_fill_price = verified.get("avg_fill_price") or exit_price
+
+        if final_status in ("REJECTED", "CANCELLED", "FAILED"):
+            reason = verified.get("rejection_reason") or verified.get("remark") or "unknown"
+            logger.error(
+                "%s BOOK_PROFIT %s REJECTED — %s | order_id=%s | "
+                "Position unchanged! Book profit manually.",
+                TAG_CRITICAL, position["trading_symbol"], reason, groww_order_id,
+            )
+            return
+
+        sell_price = float(actual_fill_price) if actual_fill_price else exit_price
         pnl = 0.0
-        if exit_price is not None:
-            pnl = (exit_price - entry_price) * close_qty
+        if sell_price is not None:
+            pnl = (sell_price - entry_price) * close_qty
 
         try:
             order_id = await self._db.insert_order(
@@ -645,14 +755,14 @@ class GrowwBroker(BrokerInterface):
                 transaction_type="SELL",
                 order_type=order_type_str,
                 quantity=close_qty,
-                price=exit_price,
+                price=sell_price,
                 order_ref=groww_order_id,
                 is_paper=False,
             )
 
             await self._db.update_order_status(
                 order_id=order_id,
-                status=response.get("order_status", "OPEN"),
+                status=final_status,
             )
 
             if remaining_qty > 0:
@@ -672,13 +782,13 @@ class GrowwBroker(BrokerInterface):
 
         if remaining_qty > 0:
             logger.info(
-                "%s PARTIAL_BP %s | closed %d/%d @ ₹%s | order_id=%s | P&L: ₹%.2f | remaining=%d",
+                "%s PARTIAL_BP %s | closed %d/%d @ ₹%s | order_id=%s status=%s | P&L: ₹%.2f | remaining=%d",
                 TAG_LIVE, position["trading_symbol"], close_qty, quantity,
-                exit_price or "MARKET", groww_order_id, pnl, remaining_qty,
+                sell_price or "MARKET", groww_order_id, final_status, pnl, remaining_qty,
             )
         else:
             logger.info(
-                "%s BOOK_PROFIT %s x%d @ ₹%s | order_id=%s | P&L: ₹%.2f",
+                "%s BOOK_PROFIT %s x%d @ ₹%s | order_id=%s status=%s | P&L: ₹%.2f",
                 TAG_LIVE, position["trading_symbol"], close_qty,
-                exit_price or "MARKET", groww_order_id, pnl,
+                sell_price or "MARKET", groww_order_id, final_status, pnl,
             )
