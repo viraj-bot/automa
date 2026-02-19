@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import pandas as pd
 from growwapi import GrowwAPI
+from growwapi.groww.exceptions import GrowwAPIAuthenticationException
 
 from broker.base import BrokerInterface
 from config.settings import Settings
@@ -105,6 +106,56 @@ class GrowwBroker(BrokerInterface):
         if self._groww is None:
             raise RuntimeError("GrowwBroker not initialised. Call initialize() first.")
         return self._groww
+
+    async def _reauthenticate(self) -> None:
+        """Generate a fresh TOTP code and obtain a new access token."""
+        loop = asyncio.get_running_loop()
+        use_totp = bool(
+            self._settings.groww_totp_token and self._settings.groww_totp_secret
+        )
+        try:
+            if use_totp:
+                import pyotp
+
+                logger.info("%s Re-authenticating via TOTP (token expired) …", TAG_GROWW_REQ)
+                totp_code = pyotp.TOTP(self._settings.groww_totp_secret).now()
+                access_token = await loop.run_in_executor(
+                    None,
+                    lambda: GrowwAPI.get_access_token(
+                        api_key=self._settings.groww_totp_token,
+                        totp=totp_code,
+                    ),
+                )
+            else:
+                logger.info("%s Re-authenticating via API key + secret (token expired) …", TAG_GROWW_REQ)
+                access_token = await loop.run_in_executor(
+                    None,
+                    lambda: GrowwAPI.get_access_token(
+                        api_key=self._settings.groww_api_token,
+                        secret=self._settings.groww_api_secret,
+                    ),
+                )
+            self._groww = GrowwAPI(access_token)
+            logger.info("%s Re-authenticated successfully", TAG_GROWW_RES)
+        except Exception:
+            logger.exception("%s Re-authentication failed", TAG_CRITICAL)
+            raise
+
+    async def _call_groww_api(self, func):
+        """Call a zero-arg callable that invokes the Groww SDK.
+
+        On ``GrowwAPIAuthenticationException`` the broker re-authenticates
+        once and retries.  Because *func* is typically a lambda that
+        references ``self.groww``, the retry naturally picks up the
+        refreshed client instance.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None, func)
+        except GrowwAPIAuthenticationException:
+            logger.warning("%s Access token expired — re-authenticating …", TAG_GROWW_REQ)
+            await self._reauthenticate()
+            return await loop.run_in_executor(None, func)
 
     # ── Instrument resolution ────────────────────────────────────────────
 
@@ -219,9 +270,6 @@ class GrowwBroker(BrokerInterface):
         product = self._settings.default_product.value  # NRML or MIS
         use_market = self._settings.entry_order_type.value == "MARKET"
 
-        # Place the main BUY order
-        loop = asyncio.get_running_loop()
-
         order_kwargs: dict[str, Any] = {
             "trading_symbol": instrument["trading_symbol"],
             "quantity": quantity,
@@ -253,8 +301,7 @@ class GrowwBroker(BrokerInterface):
         logger.info("%s place_order BUY %s", TAG_GROWW_REQ, order_params)
 
         try:
-            response = await loop.run_in_executor(
-                None,
+            response = await self._call_groww_api(
                 lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
@@ -335,7 +382,6 @@ class GrowwBroker(BrokerInterface):
         product: str,
     ) -> None:
         """Place a stop-loss SELL order to protect the position."""
-        loop = asyncio.get_running_loop()
         sl_params = {
             "trading_symbol": instrument["trading_symbol"],
             "quantity": quantity,
@@ -347,8 +393,7 @@ class GrowwBroker(BrokerInterface):
         logger.info("%s place_order SL %s", TAG_GROWW_REQ, sl_params)
 
         try:
-            response = await loop.run_in_executor(
-                None,
+            response = await self._call_groww_api(
                 lambda: self.groww.place_order(
                     trading_symbol=instrument["trading_symbol"],
                     quantity=quantity,
@@ -399,12 +444,7 @@ class GrowwBroker(BrokerInterface):
 
         product = self._settings.default_product.value
         use_market = self._settings.exit_order_type.value == "MARKET"
-        loop = asyncio.get_running_loop()
 
-        # Determine order type:
-        # - If user configured MARKET → always MARKET (guaranteed fill)
-        # - If user configured LIMIT  → use signal.exit_price when available,
-        #   otherwise fall back to MARKET (can't LIMIT without a price)
         exit_price = signal.exit_price
         if use_market or exit_price is None:
             order_type_str = "MARKET"
@@ -437,8 +477,7 @@ class GrowwBroker(BrokerInterface):
         logger.info("%s place_order EXIT %s", TAG_GROWW_REQ, exit_params)
 
         try:
-            response = await loop.run_in_executor(
-                None,
+            response = await self._call_groww_api(
                 lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
@@ -516,7 +555,6 @@ class GrowwBroker(BrokerInterface):
         entry_price = float(position["avg_entry_price"])
         product = self._settings.default_product.value
         use_market = self._settings.exit_order_type.value == "MARKET"
-        loop = asyncio.get_running_loop()
 
         # Determine how much to close.
         # For partial book-profit with 1 lot, close the entire position.
@@ -576,8 +614,7 @@ class GrowwBroker(BrokerInterface):
         logger.info("%s place_order BOOK_PROFIT %s", TAG_GROWW_REQ, bp_params)
 
         try:
-            response = await loop.run_in_executor(
-                None,
+            response = await self._call_groww_api(
                 lambda: self.groww.place_order(**order_kwargs),
             )
         except Exception:
