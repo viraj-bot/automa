@@ -120,11 +120,12 @@ async def generate_and_send_daily_summary(
 
         subject = _build_subject(today_display, today_summary)
 
-        # Locate today's daily message log file for the current mode
-        from storage.daily_log import get_daily_log_path
-        mode_str = settings.mode.value
-        daily_log = get_daily_log_path(mode=mode_str, date_str=today_str)
-        attachment = str(daily_log) if daily_log else None
+        # Locate today's application log file (the full session log)
+        mode_str = settings.mode.value.lower()
+        app_log = Path("data/logs") / mode_str / f"{mode_str}_{today_str}.log"
+        attachments: list[str] = []
+        if app_log.exists() and app_log.stat().st_size > 0:
+            attachments.append(str(app_log))
 
         # Send email in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
@@ -138,7 +139,7 @@ async def generate_and_send_daily_summary(
             settings.summary_email_to,
             subject,
             html,
-            attachment,
+            attachments,
         )
 
         logger.info("Daily summary email sent to %s", settings.summary_email_to)
@@ -541,11 +542,12 @@ async def send_backtest_summary_email(
     else:
         subject = f"Automa Backtest Report — {days} days — {total_trades} trades — {sign}₹{total_pnl:,.2f}"
 
-    # Locate today's backtest log file (if any)
-    from storage.daily_log import get_daily_log_path
+    # Locate today's backtest log file (the full session log)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    daily_log = get_daily_log_path(mode="backtest", date_str=today_str)
-    attachment = str(daily_log) if daily_log else None
+    app_log = Path("data/logs/backtest") / f"backtest_{today_str}.log"
+    attachments: list[str] = []
+    if app_log.exists() and app_log.stat().st_size > 0:
+        attachments.append(str(app_log))
 
     try:
         loop = asyncio.get_running_loop()
@@ -559,7 +561,7 @@ async def send_backtest_summary_email(
             settings.summary_email_to,
             subject,
             html,
-            attachment,
+            attachments,
         )
         logger.info("Backtest summary email sent to %s", settings.summary_email_to)
     except Exception:
@@ -819,19 +821,18 @@ def _send_email(
     to_addr: str,
     subject: str,
     html_body: str,
-    attachment_path: str | None = None,
+    attachments: list[str] | None = None,
 ) -> None:
     """Send an HTML email via SMTP (blocking — run in executor).
 
-    If *attachment_path* is provided and the file exists, it is attached
-    to the email as a text file.
+    *attachments* is a list of file paths to attach.  Missing or empty
+    files are silently skipped.
     """
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = smtp_user
     msg["To"] = to_addr
 
-    # HTML + plain-text alternative part
     alt_part = MIMEMultipart("alternative")
     plain = (
         f"{subject}\n\n"
@@ -842,21 +843,21 @@ def _send_email(
     alt_part.attach(MIMEText(html_body, "html"))
     msg.attach(alt_part)
 
-    # Attach daily log file if available
-    if attachment_path:
-        att_path = Path(attachment_path)
-        if att_path.exists() and att_path.stat().st_size > 0:
-            try:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(att_path.read_bytes())
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    f"attachment; filename={att_path.name}",
-                )
-                msg.attach(part)
-            except Exception:
-                logger.debug("Failed to attach log file %s", att_path, exc_info=True)
+    for att in (attachments or []):
+        att_path = Path(att)
+        if not att_path.exists() or att_path.stat().st_size == 0:
+            continue
+        try:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(att_path.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={att_path.name}",
+            )
+            msg.attach(part)
+        except Exception:
+            logger.debug("Failed to attach file %s", att_path, exc_info=True)
 
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.ehlo()
