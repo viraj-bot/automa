@@ -164,47 +164,37 @@ def setup_logging(level: str = "INFO", mode: str = "paper") -> None:
 
 # ── Signal table formatter ──────────────────────────────────────────────────
 def format_signal_table(signal) -> str:
-    """Build a compact ASCII table summarising a parsed trade signal.
-
-    Works with EntrySignal, ExitSignal, and BookProfitSignal without
-    importing them (uses duck-typing on common attributes).
-    """
+    """Build a horizontal ASCII table (headers row + values row)."""
     from parser.models import EntrySignal, ExitSignal, BookProfitSignal
 
-    W = 52
-    border = "+" + "-" * (W - 2) + "+"
-    title = f" {signal.signal_type.value} Signal "
-    title_line = f"|{title:=^{W - 2}}|"
-
-    def row(label: str, value: str) -> str:
-        inner = f"  {label:<16}: {value}"
-        return f"|{inner:<{W - 2}}|"
-
-    lines = [border, title_line, border]
-    lines.append(row("Instrument", signal.display_name))
+    cols: list[tuple[str, str]] = [("Signal", signal.signal_type.value)]
+    cols.append(("Instrument", signal.display_name))
 
     if isinstance(signal, EntrySignal):
-        lines.append(row("Entry Price", f"₹{signal.entry_price:,.2f}"))
-        lines.append(row("Stoploss", f"₹{signal.stoploss:,.2f}" if signal.stoploss else "—"))
+        cols.append(("Entry", f"₹{signal.entry_price:,.2f}"))
+        sl_str = f"₹{signal.stoploss:,.2f}" if signal.stoploss else "—"
+        cols.append(("SL", sl_str))
         if signal.stoploss:
             sl_pct = (signal.entry_price - signal.stoploss) / signal.entry_price * 100
-            lines.append(row("SL %", f"{sl_pct:.1f}%"))
+            cols.append(("SL%", f"{sl_pct:.1f}%"))
         if signal.targets:
-            tgt_str = " / ".join(f"₹{t:,.0f}" for t in signal.targets)
-            lines.append(row("Targets", tgt_str))
-        lines.append(row("Option", signal.option_type.value))
-        lines.append(row("Expiry", f"{signal.expiry_day} {signal.expiry_month}"))
+            cols.append(("Targets", " / ".join(f"₹{t:,.0f}" for t in signal.targets)))
+        cols.append(("Opt", signal.option_type.value))
+        cols.append(("Expiry", f"{signal.expiry_day} {signal.expiry_month}"))
 
     elif isinstance(signal, ExitSignal):
-        lines.append(row("Exit Price", f"₹{signal.exit_price:,.2f}" if signal.exit_price else "MARKET"))
+        cols.append(("Price", f"₹{signal.exit_price:,.2f}" if signal.exit_price else "MARKET"))
         if signal.option_type:
-            lines.append(row("Option", signal.option_type.value))
+            cols.append(("Opt", signal.option_type.value))
 
     elif isinstance(signal, BookProfitSignal):
-        lines.append(row("Exit Price", f"₹{signal.exit_price:,.2f}" if signal.exit_price else "MARKET"))
-        lines.append(row("Type", "PARTIAL" if signal.is_partial else "FULL"))
+        cols.append(("Price", f"₹{signal.exit_price:,.2f}" if signal.exit_price else "MARKET"))
+        cols.append(("Type", "PARTIAL" if signal.is_partial else "FULL"))
         if signal.option_type:
-            lines.append(row("Option", signal.option_type.value))
+            cols.append(("Opt", signal.option_type.value))
 
-    lines.append(border)
-    return "\n".join(lines)
+    widths = [max(len(h), len(v)) + 2 for h, v in cols]
+    sep = "+" + "+".join("-" * w for w in widths) + "+"
+    header = "|" + "|".join(f" {h:<{w - 2}} " for (h, _), w in zip(cols, widths)) + "|"
+    values = "|" + "|".join(f" {v:<{w - 2}} " for (_, v), w in zip(cols, widths)) + "|"
+    return f"{sep}\n{header}\n{sep}\n{values}\n{sep}"
