@@ -14,7 +14,9 @@ from parser.signal_parser import SignalParser
 from storage.db import Database
 from storage.daily_log import append_message
 
-from config.log_config import TAG_TELEGRAM, TAG_SIGNAL, TAG_UNPARSED, TAG_DB
+from config.log_config import (
+    TAG_TELEGRAM, TAG_SIGNAL, TAG_UNPARSED, TAG_DB, format_signal_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,8 @@ class TelegramListener:
             "%s Parsing status: OK — %s → %s",
             TAG_SIGNAL, signal.signal_type.value, signal.display_name,
         )
+        for line in format_signal_table(signal).split("\n"):
+            logger.info("%s %s", TAG_SIGNAL, line)
 
         if await self._db.is_signal_processed(signal.signal_hash):
             logger.info("%s Already processed (hash=%s), skipping", TAG_SIGNAL, signal.signal_hash)

@@ -26,9 +26,56 @@ logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+async def _fetch_groww_live_data(broker) -> dict[str, Any]:
+    """Fetch today's orders and positions from the Groww API.
+
+    Returns a dict with keys ``groww_orders`` and ``groww_positions``.
+    On any failure the corresponding list is empty (never blocks the email).
+    """
+    result: dict[str, Any] = {"groww_orders": [], "groww_positions": []}
+    if broker is None:
+        return result
+
+    try:
+        from broker.groww_broker import GrowwBroker
+        if not isinstance(broker, GrowwBroker):
+            return result
+    except ImportError:
+        return result
+
+    loop = asyncio.get_running_loop()
+
+    try:
+        orders_resp = await broker._call_groww_api(
+            lambda: broker.groww.get_order_list(segment="FNO", page=0, page_size=50),
+        )
+        result["groww_orders"] = orders_resp.get("orders", orders_resp) if isinstance(orders_resp, dict) else orders_resp
+    except Exception:
+        logger.debug("Could not fetch Groww order list for summary", exc_info=True)
+
+    try:
+        positions_resp = await broker._call_groww_api(
+            lambda: broker.groww.get_positions_for_user(segment="FNO"),
+        )
+        result["groww_positions"] = positions_resp.get("positions", positions_resp) if isinstance(positions_resp, dict) else positions_resp
+    except Exception:
+        logger.debug("Could not fetch Groww positions for summary", exc_info=True)
+
+    try:
+        margin_resp = await broker._call_groww_api(
+            lambda: broker.groww.get_available_margin_details(),
+        )
+        result["groww_margin"] = margin_resp
+    except Exception:
+        logger.debug("Could not fetch Groww margin for summary", exc_info=True)
+
+    return result
+
+
 async def generate_and_send_daily_summary(
     settings: Settings,
     db: Database,
+    broker=None,
 ) -> None:
     """Gather today's data from the DB, build an HTML email, and send it."""
     if not settings.daily_summary_enabled:
@@ -48,13 +95,16 @@ async def generate_and_send_daily_summary(
     logger.info("Generating daily summary for %s …", today_str)
 
     try:
-        # Gather data
+        # Gather data from DB
         today_closed = await db.get_today_closed_positions(today_str)
         today_opened = await db.get_today_opened_positions(today_str)
         open_positions = await db.get_all_positions(status="OPEN")
         today_summary = await db.get_today_trade_summary(today_str)
         overall_summary = await db.get_overall_trade_summary()
         signal_counts = await db.get_signals_count_for_date(today_str)
+
+        # Fetch live data from Groww API (best-effort)
+        groww_data = await _fetch_groww_live_data(broker)
 
         html = _build_html(
             date_display=today_display,
@@ -65,6 +115,7 @@ async def generate_and_send_daily_summary(
             overall_summary=overall_summary,
             signal_counts=signal_counts,
             mode=settings.mode.value.upper(),
+            groww_data=groww_data,
         )
 
         subject = _build_subject(today_display, today_summary)
@@ -123,6 +174,7 @@ def _build_html(
     overall_summary: dict[str, Any],
     signal_counts: dict[str, int],
     mode: str,
+    groww_data: dict[str, Any] | None = None,
 ) -> str:
     """Build a clean, mobile-friendly HTML email."""
 
@@ -292,6 +344,119 @@ def _build_html(
         <tr><td>Total P&L</td><td class="text-right">{_fmt_pnl(overall_pnl)}</td></tr>
     </table>"""
 
+    # ── Groww live data sections (LIVE mode only) ──
+    groww_orders_section = ""
+    groww_positions_section = ""
+    groww_margin_section = ""
+
+    if groww_data and mode == "LIVE":
+        # Groww orders
+        groww_orders = groww_data.get("groww_orders", [])
+        if isinstance(groww_orders, list) and groww_orders:
+            order_rows = ""
+            for o in groww_orders:
+                status = o.get("order_status", "—")
+                status_color = {
+                    "EXECUTED": "#16a34a", "REJECTED": "#dc2626",
+                    "CANCELLED": "#dc2626", "FAILED": "#dc2626",
+                }.get(status, "#64748b")
+                price_val = o.get("avg_fill_price") or o.get("price") or 0
+                try:
+                    price_str = f"₹{float(price_val):,.2f}"
+                except (ValueError, TypeError):
+                    price_str = str(price_val)
+                order_rows += f"""
+                <tr>
+                    <td>{o.get('trading_symbol', '—')}</td>
+                    <td class="text-center">{o.get('transaction_type', '—')}</td>
+                    <td class="text-center">{o.get('order_type', '—')}</td>
+                    <td class="text-right">{o.get('quantity', 0)}</td>
+                    <td class="text-right">{price_str}</td>
+                    <td class="text-center" style="color:{status_color};font-weight:600">{status}</td>
+                    <td style="font-size:11px">{o.get('groww_order_id', '—')[:16]}</td>
+                </tr>"""
+
+            groww_orders_section = f"""
+            <h2>Groww Orders — Today ({len(groww_orders)})</h2>
+            <div style="overflow-x:auto">
+            <table>
+                <tr>
+                    <th>Symbol</th>
+                    <th class="text-center">Side</th>
+                    <th class="text-center">Type</th>
+                    <th class="text-right">Qty</th>
+                    <th class="text-right">Price</th>
+                    <th class="text-center">Status</th>
+                    <th>Order ID</th>
+                </tr>
+                {order_rows}
+            </table>
+            </div>"""
+
+        # Groww positions
+        groww_positions = groww_data.get("groww_positions", [])
+        if isinstance(groww_positions, list) and groww_positions:
+            pos_rows = ""
+            for p in groww_positions:
+                net_qty = p.get("net_quantity", p.get("quantity", 0))
+                buy_val = p.get("buy_value", 0) or 0
+                sell_val = p.get("sell_value", 0) or 0
+                try:
+                    unrealised = float(sell_val) - float(buy_val)
+                except (ValueError, TypeError):
+                    unrealised = 0
+                avg_price = p.get("average_price", p.get("buy_avg", 0))
+                try:
+                    avg_str = f"₹{float(avg_price):,.2f}"
+                except (ValueError, TypeError):
+                    avg_str = str(avg_price)
+                ltp = p.get("ltp", p.get("last_traded_price", "—"))
+                try:
+                    ltp_str = f"₹{float(ltp):,.2f}"
+                except (ValueError, TypeError):
+                    ltp_str = str(ltp)
+                pos_rows += f"""
+                <tr>
+                    <td>{p.get('trading_symbol', '—')}</td>
+                    <td class="text-right">{net_qty}</td>
+                    <td class="text-right">{avg_str}</td>
+                    <td class="text-right">{ltp_str}</td>
+                    <td class="text-right">{_fmt_pnl(unrealised)}</td>
+                </tr>"""
+
+            groww_positions_section = f"""
+            <h2>Groww Live Positions ({len(groww_positions)})</h2>
+            <table>
+                <tr>
+                    <th>Symbol</th>
+                    <th class="text-right">Net Qty</th>
+                    <th class="text-right">Avg Price</th>
+                    <th class="text-right">LTP</th>
+                    <th class="text-right">Unrealised P&L</th>
+                </tr>
+                {pos_rows}
+            </table>"""
+
+        # Groww margin
+        groww_margin = groww_data.get("groww_margin")
+        if isinstance(groww_margin, dict) and groww_margin:
+            avail = groww_margin.get("available_margin", groww_margin.get("net", "—"))
+            used = groww_margin.get("used_margin", groww_margin.get("utilised", "—"))
+            try:
+                avail_str = f"₹{float(avail):,.2f}"
+            except (ValueError, TypeError):
+                avail_str = str(avail)
+            try:
+                used_str = f"₹{float(used):,.2f}"
+            except (ValueError, TypeError):
+                used_str = str(used)
+            groww_margin_section = f"""
+            <h2>Groww Account</h2>
+            <table>
+                <tr><td>Available Margin</td><td class="text-right"><b>{avail_str}</b></td></tr>
+                <tr><td>Used Margin</td><td class="text-right">{used_str}</td></tr>
+            </table>"""
+
     # ── Assemble ──
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -332,8 +497,11 @@ def _build_html(
             <tr><td>Worst trade</td><td class="text-right">{_fmt_pnl(worst)}</td></tr>
         </table>
 
+        {groww_margin_section}
         {trades_section}
+        {groww_orders_section}
         {open_section}
+        {groww_positions_section}
         {signal_section}
         {overall_section}
     </div>

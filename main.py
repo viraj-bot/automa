@@ -84,7 +84,7 @@ async def _run_live_or_paper(mode: str) -> None:
 
     # ── Start the daily summary scheduler as a background task ──
     scheduler_task = asyncio.create_task(
-        run_daily_summary_scheduler(settings, db, shutdown_event)
+        run_daily_summary_scheduler(settings, db, shutdown_event, broker=broker)
     )
 
     # ── Reconnection loop ──

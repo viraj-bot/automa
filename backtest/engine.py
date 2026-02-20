@@ -13,7 +13,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from config.settings import Settings
-from config.log_config import TAG_BT, TAG_GROWW_REQ, TAG_GROWW_RES, TAG_GROWW_ERR
+from config.log_config import TAG_BT, TAG_GROWW_REQ, TAG_GROWW_RES, TAG_GROWW_ERR, format_signal_table
 from parser.models import (
     BookProfitSignal,
     EntrySignal,
@@ -182,15 +182,14 @@ class BacktestEngine:
                     else:
                         entries_without_targets += 1
                     logger.info(
-                        "%s Parsing status: OK — ENTRY %s | price=₹%.2f | SL=₹%s | targets=%s",
-                        TAG_BT, signal.display_name, signal.entry_price,
-                        signal.stoploss, signal.targets,
+                        "%s Parsing status: OK — ENTRY %s",
+                        TAG_BT, signal.display_name,
                     )
                 elif isinstance(signal, ExitSignal):
                     exit_count += 1
                     logger.info(
-                        "%s Parsing status: OK — EXIT %s | exit_price=₹%s",
-                        TAG_BT, signal.display_name, signal.exit_price,
+                        "%s Parsing status: OK — EXIT %s",
+                        TAG_BT, signal.display_name,
                     )
                 elif isinstance(signal, BookProfitSignal):
                     bp_count += 1
@@ -199,9 +198,12 @@ class BacktestEngine:
                     else:
                         bp_without_price += 1
                     logger.info(
-                        "%s Parsing status: OK — BOOK_PROFIT %s | exit_price=₹%s | partial=%s",
-                        TAG_BT, signal.display_name, signal.exit_price, signal.is_partial,
+                        "%s Parsing status: OK — BOOK_PROFIT %s",
+                        TAG_BT, signal.display_name,
                     )
+
+                for line in format_signal_table(signal).split("\n"):
+                    logger.info("%s %s", TAG_BT, line)
 
                 await self._process_signal(signal, signal_id, msg["date"])
             except Exception:

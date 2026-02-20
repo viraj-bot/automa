@@ -90,6 +90,7 @@ async def run_daily_summary_scheduler(
     settings: Settings,
     db: Database,
     shutdown_event: asyncio.Event,
+    broker=None,
 ) -> None:
     """Background loop that fires the daily summary at the configured time.
 
@@ -150,7 +151,7 @@ async def run_daily_summary_scheduler(
 
         logger.info("%s Firing daily summary for %s …", TAG_SCHEDULER, today_str)
         try:
-            await generate_and_send_daily_summary(settings, db)
+            await generate_and_send_daily_summary(settings, db, broker=broker)
             last_sent_date = today_str
         except Exception:
             logger.exception("%s Daily summary failed — will retry in 5 minutes", TAG_SCHEDULER)
