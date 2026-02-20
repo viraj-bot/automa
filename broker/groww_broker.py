@@ -286,6 +286,8 @@ class GrowwBroker(BrokerInterface):
             await self._execute_entry_inner(signal, signal_id)
         except Exception:
             logger.exception("%s Unhandled error in execute_entry for %s", TAG_LIVE, signal.display_name)
+        finally:
+            logger.info("")
 
     async def _execute_entry_inner(self, signal: EntrySignal, signal_id: int) -> None:
         instrument = self.resolve_trading_symbol(
@@ -508,6 +510,8 @@ class GrowwBroker(BrokerInterface):
             await self._execute_exit_inner(signal, signal_id)
         except Exception:
             logger.exception("%s Unhandled error in execute_exit for %s", TAG_LIVE, signal.display_name)
+        finally:
+            logger.info("")
 
     async def _execute_exit_inner(self, signal: ExitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
@@ -630,6 +634,8 @@ class GrowwBroker(BrokerInterface):
             await self._execute_book_profit_inner(signal, signal_id)
         except Exception:
             logger.exception("%s Unhandled error in execute_book_profit for %s", TAG_LIVE, signal.display_name)
+        finally:
+            logger.info("")
 
     async def _execute_book_profit_inner(self, signal: BookProfitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(

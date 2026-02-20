@@ -139,6 +139,8 @@ class PaperBroker(BrokerInterface):
             await self._execute_entry_inner(signal, signal_id)
         except Exception:
             logger.exception("%s Failed to execute entry for %s", TAG_PAPER, signal.display_name)
+        finally:
+            logger.info("")
 
     async def _execute_entry_inner(self, signal: EntrySignal, signal_id: int) -> None:
         instrument = self.resolve_trading_symbol(
@@ -226,6 +228,8 @@ class PaperBroker(BrokerInterface):
             await self._execute_exit_inner(signal, signal_id)
         except Exception:
             logger.exception("%s Failed to execute exit for %s", TAG_PAPER, signal.display_name)
+        finally:
+            logger.info("")
 
     async def _execute_exit_inner(self, signal: ExitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
@@ -289,6 +293,8 @@ class PaperBroker(BrokerInterface):
             await self._execute_book_profit_inner(signal, signal_id)
         except Exception:
             logger.exception("%s Failed to execute book profit for %s", TAG_PAPER, signal.display_name)
+        finally:
+            logger.info("")
 
     async def _execute_book_profit_inner(self, signal: BookProfitSignal, signal_id: int) -> None:
         position = await self._db.find_open_position(
