@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -25,6 +26,10 @@ class TelegramListener:
     """Connects to Telegram as a user account and listens for new messages
     in the configured group.  Each message is parsed and, if it contains a
     valid trade signal, forwarded to the broker for execution.
+
+    Every incoming message is dispatched to its own ``asyncio.Task`` so
+    that slow broker operations (Groww API calls, order verification)
+    never block the reception of subsequent messages.
     """
 
     def __init__(
@@ -39,6 +44,7 @@ class TelegramListener:
         self._broker = broker
         self._db = db
         self._client: Optional[TelegramClient] = None
+        self._tasks: set[asyncio.Task] = set()
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -77,23 +83,39 @@ class TelegramListener:
         await self._client.run_until_disconnected()
 
     async def stop(self) -> None:
+        if self._tasks:
+            logger.info("%s Waiting for %d in-flight message tasks …", TAG_TELEGRAM, len(self._tasks))
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
         if self._client:
             await self._client.disconnect()
             logger.info("%s Listener stopped", TAG_TELEGRAM)
 
     # ── Event handler ────────────────────────────────────────────────────
 
-    async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        """Called for every new message in the target group.
+    def _task_done(self, task: asyncio.Task) -> None:
+        """Callback to remove finished tasks and log uncaught errors."""
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.exception(
+                "Unhandled error in message task — skipping and continuing",
+                exc_info=exc,
+            )
 
-        This handler is wrapped in a top-level try/except so that **no
-        single message** — regardless of parser bugs, DB errors, broker
-        failures, or network issues — can crash the long-running daemon.
-        """
+    async def _on_new_message(self, event: events.NewMessage.Event) -> None:
+        """Dispatch each message to its own asyncio task for concurrent processing."""
+        task = asyncio.create_task(self._safe_handle(event))
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    async def _safe_handle(self, event: events.NewMessage.Event) -> None:
+        """Top-level wrapper so no single message can crash the daemon."""
         try:
             await self._handle_message(event)
         except Exception:
-            # Last-resort catch: log and continue listening
             msg_id = getattr(getattr(event, "message", None), "id", "?")
             logger.exception(
                 "Unhandled error processing message %s — skipping and continuing",
@@ -122,8 +144,10 @@ class TelegramListener:
         if len(preview) > 200:
             preview = preview[:200] + "…"
 
+        logger.info("")
         logger.info(_SEP)
-        logger.info("%s Original message: %s", TAG_TELEGRAM, preview)
+        logger.info("%s Original message (msg_id=%s): %s", TAG_TELEGRAM, msg_id, preview)
+        logger.info("")
 
         signal: Optional[TradeSignal] = self._parser.parse(
             text, message_id=msg_id, timestamp=timestamp
@@ -133,6 +157,7 @@ class TelegramListener:
                 "%s Parsing status: FAILED — could not parse signal from message",
                 TAG_UNPARSED,
             )
+            logger.info("")
             return
 
         logger.info(
@@ -141,9 +166,11 @@ class TelegramListener:
         )
         for line in format_signal_table(signal).split("\n"):
             logger.info("%s %s", TAG_SIGNAL, line)
+        logger.info("")
 
         if await self._db.is_signal_processed(signal.signal_hash):
             logger.info("%s Already processed (hash=%s), skipping", TAG_SIGNAL, signal.signal_hash)
+            logger.info("")
             return
 
         try:
@@ -161,3 +188,5 @@ class TelegramListener:
             await self._db.mark_signal_processed(signal.signal_hash)
         except Exception:
             logger.exception("%s Failed to mark signal %s as processed", TAG_DB, signal.signal_hash)
+
+        logger.info("")
