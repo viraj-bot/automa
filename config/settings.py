@@ -97,6 +97,12 @@ class Settings(BaseSettings):
         le=100,
         description="Default stoploss as % below entry price, used when the signal has no SL",
     )
+    sl_limit_buffer_percent: float = Field(
+        default=2.0,
+        ge=0,
+        le=50,
+        description="Buffer % below SL trigger price for the SL-L limit price (e.g. 2.0 means limit = trigger * 0.98)",
+    )
 
     # ── Database ──
     database_path: str = Field(

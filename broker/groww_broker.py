@@ -493,13 +493,24 @@ class GrowwBroker(BrokerInterface):
         signal_id: int,
         product: str,
     ) -> None:
-        """Place a stop-loss SELL order to protect the position."""
+        """Place a stop-loss limit (SL-L) SELL order to protect the position.
+
+        Uses ``ORDER_TYPE_STOP_LOSS`` (SL-L) instead of SL-M because
+        Groww/NSE blocks SL-M orders on options contracts.  The limit
+        price is set slightly below the trigger price using the
+        ``sl_limit_buffer_percent`` setting to allow for slippage.
+        """
+        buffer_pct = self._settings.sl_limit_buffer_percent
+        limit_price = round(trigger_price * (1 - buffer_pct / 100), 2)
+        limit_price = max(limit_price, 0.05)
+
         sl_params = {
             "trading_symbol": instrument["trading_symbol"],
             "quantity": quantity,
-            "order_type": "SL_M",
+            "order_type": "SL_L",
             "transaction_type": "SELL",
             "trigger_price": trigger_price,
+            "limit_price": limit_price,
             "product": product,
         }
         logger.info("%s place_order SL %s", TAG_GROWW_REQ, sl_params)
@@ -513,9 +524,10 @@ class GrowwBroker(BrokerInterface):
                     exchange=self.groww.EXCHANGE_NSE,
                     segment=self.groww.SEGMENT_FNO,
                     product=getattr(self.groww, f"PRODUCT_{product}"),
-                    order_type=self.groww.ORDER_TYPE_STOP_LOSS_MARKET,
+                    order_type=self.groww.ORDER_TYPE_STOP_LOSS,
                     transaction_type=self.groww.TRANSACTION_TYPE_SELL,
                     trigger_price=trigger_price,
+                    price=limit_price,
                 ),
             )
             sl_order_id = response.get("groww_order_id", "")
@@ -535,8 +547,8 @@ class GrowwBroker(BrokerInterface):
                 )
             else:
                 logger.info(
-                    "%s SL placed for %s @ ₹%.2f | order_id=%s status=%s",
-                    TAG_LIVE, instrument["trading_symbol"], trigger_price,
+                    "%s SL placed for %s trigger=₹%.2f limit=₹%.2f | order_id=%s status=%s",
+                    TAG_LIVE, instrument["trading_symbol"], trigger_price, limit_price,
                     sl_order_id, sl_status,
                 )
         except Exception:
