@@ -244,14 +244,37 @@ class PaperBroker(BrokerInterface):
             positions = await self._db.find_all_open_positions_for_underlying(
                 signal.underlying
             )
-            if not positions:
-                logger.warning(
-                    "%s No open position found for EXIT %s", TAG_PAPER, signal.display_name
-                )
-                return
-            position = positions[0]
+            if positions:
+                position = positions[0]
 
         order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
+
+        if position is None:
+            # No matching position in DB — still record the exit signal/order
+            # for audit trail (the real platform may have the position).
+            exit_price = signal.exit_price or 0.0
+            trading_symbol = f"{signal.underlying}{signal.expiry_day or 0:02d}{(signal.expiry_month or 'XXX')[:3].upper()}{int(signal.strike_price or 0)}{signal.option_type.value if signal.option_type else 'XX'}"
+
+            logger.warning(
+                "%s No open position in DB for EXIT %s — "
+                "recording exit order for audit trail",
+                TAG_PAPER, signal.display_name,
+            )
+
+            order_id = await self._db.insert_order(
+                signal_id=signal_id,
+                trading_symbol=trading_symbol,
+                transaction_type="SELL",
+                order_type="LIMIT" if signal.exit_price is not None else "MARKET",
+                quantity=0,
+                price=exit_price,
+                order_ref=order_ref,
+                is_paper=True,
+            )
+            await self._db.update_order_status(
+                order_id=order_id, status="EXECUTED",
+            )
+            return
 
         if signal.exit_price is not None:
             exit_price = signal.exit_price
@@ -309,13 +332,34 @@ class PaperBroker(BrokerInterface):
             positions = await self._db.find_all_open_positions_for_underlying(
                 signal.underlying
             )
-            if not positions:
-                logger.warning(
-                    "%s No open position found for BOOK_PROFIT %s",
-                    TAG_PAPER, signal.display_name,
-                )
-                return
-            position = positions[0]
+            if positions:
+                position = positions[0]
+
+        if position is None:
+            exit_price = signal.exit_price or 0.0
+            trading_symbol = f"{signal.underlying}{signal.expiry_day or 0:02d}{(signal.expiry_month or 'XXX')[:3].upper()}{int(signal.strike_price or 0)}{signal.option_type.value if signal.option_type else 'XX'}"
+
+            logger.warning(
+                "%s No open position in DB for BOOK_PROFIT %s — "
+                "recording order for audit trail",
+                TAG_PAPER, signal.display_name,
+            )
+
+            order_ref = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
+            order_id = await self._db.insert_order(
+                signal_id=signal_id,
+                trading_symbol=trading_symbol,
+                transaction_type="SELL",
+                order_type="LIMIT",
+                quantity=0,
+                price=exit_price,
+                order_ref=order_ref,
+                is_paper=True,
+            )
+            await self._db.update_order_status(
+                order_id=order_id, status="EXECUTED",
+            )
+            return
 
         exit_price = signal.exit_price or position["avg_entry_price"]
         quantity = int(position["quantity"])

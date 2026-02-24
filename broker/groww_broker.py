@@ -202,6 +202,49 @@ class GrowwBroker(BrokerInterface):
         )
         return last_resp
 
+    # ── Position verification against Groww ─────────────────────────────
+
+    async def _verify_position_on_groww(
+        self, trading_symbol: str, segment: str = "FNO",
+    ) -> Optional[dict[str, Any]]:
+        """Fetch live positions from Groww and return the one matching *trading_symbol*.
+
+        Returns the position dict if the instrument still has a non-zero net
+        quantity on Groww, or ``None`` if the position is fully closed (absent
+        or qty == 0).
+        """
+        try:
+            resp = await self._call_groww_api(
+                lambda: self.groww.get_positions_for_user(segment=segment),
+            )
+            positions = resp.get("positions", resp) if isinstance(resp, dict) else resp
+            if not isinstance(positions, list):
+                logger.warning(
+                    "%s Unexpected positions response type: %s",
+                    TAG_GROWW_ERR, type(positions).__name__,
+                )
+                return None
+
+            for pos in positions:
+                if pos.get("trading_symbol") == trading_symbol:
+                    net_qty = pos.get("quantity", 0)
+                    try:
+                        net_qty = float(net_qty)
+                    except (ValueError, TypeError):
+                        net_qty = 0
+                    if net_qty != 0:
+                        return pos
+                    return None
+
+            return None
+        except Exception:
+            logger.warning(
+                "%s Could not verify position on Groww for %s — "
+                "proceeding with order-based status",
+                TAG_GROWW_ERR, trading_symbol, exc_info=True,
+            )
+            return None
+
     # ── Instrument resolution ────────────────────────────────────────────
 
     def resolve_trading_symbol(
@@ -619,7 +662,38 @@ class GrowwBroker(BrokerInterface):
                 status=final_status,
             )
 
-            await self._db.close_position(position["id"], pnl=pnl)
+            # Verify against Groww positions (source of truth)
+            groww_pos = await self._verify_position_on_groww(
+                position["trading_symbol"],
+            )
+            if groww_pos is None:
+                await self._db.close_position(position["id"], pnl=pnl)
+                logger.info(
+                    "%s Groww confirms position fully closed for %s",
+                    TAG_LIVE, position["trading_symbol"],
+                )
+            else:
+                remaining = int(float(groww_pos.get("quantity", 0)))
+                logger.error(
+                    "%s EXIT order executed but Groww still shows %d qty for %s! "
+                    "DB updated with actual remaining. Manual check recommended.",
+                    TAG_CRITICAL, remaining, position["trading_symbol"],
+                )
+                closed_qty = position["quantity"] - remaining
+                if closed_qty > 0:
+                    partial_pnl = (sell_price - position["avg_entry_price"]) * closed_qty if sell_price else 0.0
+                    await self._db.partial_close_position(
+                        position["id"],
+                        close_qty=closed_qty,
+                        partial_pnl=partial_pnl,
+                    )
+                else:
+                    logger.error(
+                        "%s Groww qty (%d) >= DB qty (%d) for %s — "
+                        "position left OPEN in DB. Reconcile manually.",
+                        TAG_CRITICAL, remaining, position["quantity"],
+                        position["trading_symbol"],
+                    )
         except Exception:
             logger.exception(
                 "%s EXIT order %s placed on Groww but DB recording failed! "
@@ -771,14 +845,37 @@ class GrowwBroker(BrokerInterface):
                 status=final_status,
             )
 
-            if remaining_qty > 0:
-                await self._db.partial_close_position(
-                    position["id"],
-                    close_qty=close_qty,
-                    partial_pnl=pnl,
+            # Verify against Groww positions (source of truth)
+            groww_pos = await self._verify_position_on_groww(
+                position["trading_symbol"],
+            )
+            if groww_pos is None:
+                await self._db.close_position(position["id"], pnl=pnl)
+                logger.info(
+                    "%s Groww confirms position fully closed for %s",
+                    TAG_LIVE, position["trading_symbol"],
                 )
             else:
-                await self._db.close_position(position["id"], pnl=pnl)
+                actual_remaining = int(float(groww_pos.get("quantity", 0)))
+                actual_closed = quantity - actual_remaining
+                if actual_closed > 0:
+                    actual_pnl = (sell_price - entry_price) * actual_closed if sell_price else 0.0
+                    await self._db.partial_close_position(
+                        position["id"],
+                        close_qty=actual_closed,
+                        partial_pnl=actual_pnl,
+                    )
+                    logger.info(
+                        "%s Groww shows %d remaining for %s (closed %d via book profit)",
+                        TAG_LIVE, actual_remaining, position["trading_symbol"], actual_closed,
+                    )
+                else:
+                    logger.error(
+                        "%s BOOK_PROFIT order executed but Groww still shows "
+                        "%d qty for %s — position unchanged in DB. "
+                        "Manual check recommended.",
+                        TAG_CRITICAL, actual_remaining, position["trading_symbol"],
+                    )
         except Exception:
             logger.exception(
                 "%s BOOK_PROFIT order %s placed on Groww but DB recording "

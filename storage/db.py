@@ -380,6 +380,21 @@ class Database:
 
     # ── Daily summary queries ─────────────────────────────────────────
 
+    async def get_carry_forward_positions(self, date_str: str) -> list[dict[str, Any]]:
+        """Return open positions that were opened before *date_str* (YYYY-MM-DD).
+
+        These are trades carried forward from previous days.
+        """
+        cursor = await self.conn.execute(
+            """SELECT * FROM positions
+               WHERE status = 'OPEN'
+                 AND date(opened_at) < ?
+               ORDER BY opened_at ASC""",
+            (date_str,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def get_today_closed_positions(self, date_str: str) -> list[dict[str, Any]]:
         """Return all positions closed on the given date (YYYY-MM-DD)."""
         cursor = await self.conn.execute(

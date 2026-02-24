@@ -99,6 +99,7 @@ async def generate_and_send_daily_summary(
         today_closed = await db.get_today_closed_positions(today_str)
         today_opened = await db.get_today_opened_positions(today_str)
         open_positions = await db.get_all_positions(status="OPEN")
+        carry_forward = await db.get_carry_forward_positions(today_str)
         today_summary = await db.get_today_trade_summary(today_str)
         overall_summary = await db.get_overall_trade_summary()
         signal_counts = await db.get_signals_count_for_date(today_str)
@@ -111,6 +112,7 @@ async def generate_and_send_daily_summary(
             today_closed=today_closed,
             today_opened=today_opened,
             open_positions=open_positions,
+            carry_forward=carry_forward,
             today_summary=today_summary,
             overall_summary=overall_summary,
             signal_counts=signal_counts,
@@ -120,12 +122,30 @@ async def generate_and_send_daily_summary(
 
         subject = _build_subject(today_display, today_summary)
 
-        # Locate today's application log file (the full session log)
+        # Resolve log directory relative to this file, not the working directory
+        _project_root = Path(__file__).resolve().parent.parent
+        _logs_dir = _project_root / "data" / "logs"
         mode_str = settings.mode.value.lower()
-        app_log = Path("data/logs") / mode_str / f"{mode_str}_{today_str}.log"
+
         attachments: list[str] = []
+
+        # Application log (.log)
+        app_log = _logs_dir / mode_str / f"{mode_str}_{today_str}.log"
         if app_log.exists() and app_log.stat().st_size > 0:
             attachments.append(str(app_log))
+        else:
+            logger.warning(
+                "Application log not found or empty: %s", app_log,
+            )
+
+        # Daily message log (.txt) — raw Telegram messages
+        msg_log = _logs_dir / mode_str / f"{mode_str}_{today_str}.txt"
+        if msg_log.exists() and msg_log.stat().st_size > 0:
+            attachments.append(str(msg_log))
+        else:
+            logger.warning(
+                "Daily message log not found or empty: %s", msg_log,
+            )
 
         # Send email in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
@@ -171,6 +191,7 @@ def _build_html(
     today_closed: list[dict[str, Any]],
     today_opened: list[dict[str, Any]],
     open_positions: list[dict[str, Any]],
+    carry_forward: list[dict[str, Any]],
     today_summary: dict[str, Any],
     overall_summary: dict[str, Any],
     signal_counts: dict[str, int],
@@ -325,6 +346,53 @@ def _build_html(
         </table>"""
     else:
         open_section = ""
+
+    # ── Carry-forward positions (opened on previous days, still open) ──
+    if carry_forward:
+        cf_rows = ""
+        for i, pos in enumerate(carry_forward, 1):
+            opened_at = pos.get("opened_at", "—")
+            if opened_at and opened_at != "—":
+                try:
+                    opened_dt = datetime.fromisoformat(opened_at)
+                    days_held = (datetime.now(IST) - opened_dt.replace(tzinfo=IST)).days
+                    opened_display = opened_dt.strftime("%d %b %Y")
+                except (ValueError, TypeError):
+                    days_held = "?"
+                    opened_display = str(opened_at)[:10]
+            else:
+                days_held = "?"
+                opened_display = "—"
+
+            cf_rows += f"""
+            <tr>
+                <td class="text-center">{i}</td>
+                <td>{pos.get('trading_symbol', '—')}</td>
+                <td class="text-center">{pos.get('option_type', '—')}</td>
+                <td class="text-right">{pos.get('quantity', 0)}</td>
+                <td class="text-right">₹{pos.get('avg_entry_price', 0):,.2f}</td>
+                <td class="text-right">₹{pos.get('stoploss', 0) or 0:,.2f}</td>
+                <td class="text-center">{opened_display}</td>
+                <td class="text-center">{days_held}d</td>
+            </tr>"""
+
+        carry_forward_section = f"""
+        <h2>Carry-Forward Positions ({len(carry_forward)})</h2>
+        <table>
+            <tr>
+                <th class="text-center">#</th>
+                <th>Instrument</th>
+                <th class="text-center">Type</th>
+                <th class="text-right">Qty</th>
+                <th class="text-right">Entry ₹</th>
+                <th class="text-right">SL ₹</th>
+                <th class="text-center">Opened On</th>
+                <th class="text-center">Held</th>
+            </tr>
+            {cf_rows}
+        </table>"""
+    else:
+        carry_forward_section = ""
 
     # ── Signal activity ──
     signal_section = f"""
@@ -502,6 +570,7 @@ def _build_html(
         {trades_section}
         {groww_orders_section}
         {open_section}
+        {carry_forward_section}
         {groww_positions_section}
         {signal_section}
         {overall_section}
@@ -543,11 +612,14 @@ async def send_backtest_summary_email(
         subject = f"Automa Backtest Report — {days} days — {total_trades} trades — {sign}₹{total_pnl:,.2f}"
 
     # Locate today's backtest log file (the full session log)
+    _project_root = Path(__file__).resolve().parent.parent
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    app_log = Path("data/logs/backtest") / f"backtest_{today_str}.log"
+    app_log = _project_root / "data" / "logs" / "backtest" / f"backtest_{today_str}.log"
     attachments: list[str] = []
     if app_log.exists() and app_log.stat().st_size > 0:
         attachments.append(str(app_log))
+    else:
+        logger.warning("Backtest log not found or empty: %s", app_log)
 
     try:
         loop = asyncio.get_running_loop()
